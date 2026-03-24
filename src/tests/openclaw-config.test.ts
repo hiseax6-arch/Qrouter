@@ -50,7 +50,7 @@ describe('applyQingfuRouterIntegration', () => {
   test('preserves existing router env value if already present', () => {
     const output = applyQingfuRouterIntegration({
       env: {
-        QINGFU_ROUTER_API_KEY: 'already-set',
+        Q_ROUTER_API_KEY: 'already-set',
       },
       agents: {
         defaults: {
@@ -61,7 +61,7 @@ describe('applyQingfuRouterIntegration', () => {
       },
     });
 
-    expect(output.env?.QINGFU_ROUTER_API_KEY).toBe('already-set');
+    expect(output.env?.Q_ROUTER_API_KEY).toBe('already-set');
   });
 
   test('supports skipping fallback preservation when requested', () => {
@@ -135,7 +135,7 @@ describe('rollbackQingfuRouterIntegration', () => {
       cleanupRouterEnvVarOnRollback: true,
     });
 
-    expect(rolledBack.env?.QINGFU_ROUTER_API_KEY).toBeUndefined();
+    expect(rolledBack.env?.Q_ROUTER_API_KEY).toBeUndefined();
   });
 
   test('reports the exact changed path set for apply and rollback', () => {
@@ -166,7 +166,7 @@ describe('rollbackQingfuRouterIntegration', () => {
       'agents.defaults.model.fallbacks',
       'models.providers.qingfuCodex',
       'agents.defaults.models.qingfuCodex/gpt-5.4',
-      'env.QINGFU_ROUTER_API_KEY',
+      'env.Q_ROUTER_API_KEY',
     ]);
     expect(diffQingfuIntegrationPaths(applied, rolledBack)).toEqual([
       'agents.defaults.model.primary',

@@ -96,7 +96,7 @@ describe('POST /v1/chat/completions', () => {
 
   test('retries a timeout-classified upstream failure and returns the later semantic success', async () => {
     let attempts = 0;
-    const tempDir = mkdtempSync(join(tmpdir(), 'qingfu-router-timeout-'));
+    const tempDir = mkdtempSync(join(tmpdir(), 'Q-router-timeout-'));
     const jsonlPath = join(tempDir, 'events.jsonl');
     const sqlitePath = join(tempDir, 'summaries.sqlite');
     const traceStore = createTraceStore({ jsonlPath, sqlitePath });
@@ -295,7 +295,7 @@ describe('POST /v1/chat/completions', () => {
 
   test('does not double-send after stream commit and surfaces an explicit SSE error with trace evidence', async () => {
     let attempts = 0;
-    const tempDir = mkdtempSync(join(tmpdir(), 'qingfu-router-stream-post-commit-'));
+    const tempDir = mkdtempSync(join(tmpdir(), 'Q-router-stream-post-commit-'));
     const jsonlPath = join(tempDir, 'events.jsonl');
     const sqlitePath = join(tempDir, 'summaries.sqlite');
     const traceStore = createTraceStore({ jsonlPath, sqlitePath });
@@ -370,7 +370,7 @@ describe('POST /v1/chat/completions', () => {
 
   test('returns explicit retry exhaustion for timeout failures and leaves enough diagnostics to explain the outcome', async () => {
     let attempts = 0;
-    const tempDir = mkdtempSync(join(tmpdir(), 'qingfu-router-timeout-exhausted-'));
+    const tempDir = mkdtempSync(join(tmpdir(), 'Q-router-timeout-exhausted-'));
     const jsonlPath = join(tempDir, 'events.jsonl');
     const sqlitePath = join(tempDir, 'summaries.sqlite');
     const traceStore = createTraceStore({ jsonlPath, sqlitePath });
@@ -447,7 +447,7 @@ describe('POST /v1/chat/completions', () => {
   });
 
   test('persists JSONL events and SQLite summaries for request forensics', async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), 'qingfu-router-traces-'));
+    const tempDir = mkdtempSync(join(tmpdir(), 'Q-router-traces-'));
     const jsonlPath = join(tempDir, 'events.jsonl');
     const sqlitePath = join(tempDir, 'summaries.sqlite');
     const traceStore = createTraceStore({ jsonlPath, sqlitePath });

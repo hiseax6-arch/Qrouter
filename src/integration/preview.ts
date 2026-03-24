@@ -31,7 +31,7 @@ console.log(
       changedPaths,
       configPreview: {
         env: {
-          QINGFU_ROUTER_API_KEY: result.env?.QINGFU_ROUTER_API_KEY ?? null,
+          Q_ROUTER_API_KEY: result.env?.Q_ROUTER_API_KEY ?? null,
         },
         agents: {
           defaults: {

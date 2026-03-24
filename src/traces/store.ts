@@ -37,15 +37,21 @@ export type TracePaths = {
   sqlitePath: string;
 };
 
+export type TracePathOverrides = {
+  dir?: string;
+  jsonlPath?: string;
+  sqlitePath?: string;
+};
+
 function ensureParent(path: string): void {
   mkdirSync(dirname(path), { recursive: true });
 }
 
-export function resolveTracePaths(): TracePaths {
-  const baseDir = process.env.QINGFU_TRACE_DIR ?? join(process.cwd(), '.qingfu-router');
+export function resolveTracePaths(overrides: TracePathOverrides = {}): TracePaths {
+  const baseDir = overrides.dir ?? process.env.Q_TRACE_DIR ?? join(process.cwd(), '.Q-router');
   return {
-    jsonlPath: process.env.QINGFU_TRACE_JSONL_PATH ?? join(baseDir, 'events.jsonl'),
-    sqlitePath: process.env.QINGFU_TRACE_SQLITE_PATH ?? join(baseDir, 'summaries.sqlite'),
+    jsonlPath: overrides.jsonlPath ?? process.env.Q_TRACE_JSONL_PATH ?? join(baseDir, 'events.jsonl'),
+    sqlitePath: overrides.sqlitePath ?? process.env.Q_TRACE_SQLITE_PATH ?? join(baseDir, 'summaries.sqlite'),
   };
 }
 

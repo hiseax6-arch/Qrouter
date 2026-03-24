@@ -40,7 +40,7 @@ export function applyQingfuRouterIntegration(
   const providerId = options.providerId ?? 'qingfuCodex';
   const upstreamModelId = options.upstreamModelId ?? 'gpt-5.4';
   const routerBaseUrl = options.routerBaseUrl ?? 'http://127.0.0.1:4318/v1';
-  const routerApiKeyEnvVar = options.routerApiKeyEnvVar ?? 'QINGFU_ROUTER_API_KEY';
+  const routerApiKeyEnvVar = options.routerApiKeyEnvVar ?? 'Q_ROUTER_API_KEY';
   const next = cloneConfig(input ?? {});
 
   next.env = { ...(next.env ?? {}) };
@@ -97,7 +97,7 @@ export function rollbackQingfuRouterIntegration(
   options: QingfuIntegrationOptions = {},
 ): OpenClawConfigLike {
   const providerId = options.providerId ?? 'qingfuCodex';
-  const routerApiKeyEnvVar = options.routerApiKeyEnvVar ?? 'QINGFU_ROUTER_API_KEY';
+  const routerApiKeyEnvVar = options.routerApiKeyEnvVar ?? 'Q_ROUTER_API_KEY';
   const nextPrimary = getNextPrimary(options);
   const next = cloneConfig(input ?? {});
 
@@ -188,10 +188,10 @@ export function diffQingfuIntegrationPaths(
     changed.push(`agents.defaults.models.${providerId}/gpt-5.4`);
   }
 
-  const beforeEnv = before.env?.QINGFU_ROUTER_API_KEY ?? null;
-  const afterEnv = after.env?.QINGFU_ROUTER_API_KEY ?? null;
+  const beforeEnv = before.env?.Q_ROUTER_API_KEY ?? null;
+  const afterEnv = after.env?.Q_ROUTER_API_KEY ?? null;
   if (beforeEnv !== afterEnv) {
-    changed.push('env.QINGFU_ROUTER_API_KEY');
+    changed.push('env.Q_ROUTER_API_KEY');
   }
 
   return changed;

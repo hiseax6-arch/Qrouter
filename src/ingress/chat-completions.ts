@@ -23,6 +23,7 @@ export type ChatCompletionsDeps = {
   fetchUpstream: FetchUpstream;
   retryPolicy: RetryPolicy;
   traceStore: TraceStore;
+  allowedModels?: Set<string>;
 };
 
 type ChatCompletionsRequestBody = {
@@ -79,6 +80,14 @@ function classifyThrownUpstreamError(error: unknown): 'timeout' | 'connection_er
 
 function isStreamingRequest(body: ChatCompletionsRequestBody): boolean {
   return body.stream === true;
+}
+
+function normalizeAllowedModel(model: string | null): string | null {
+  if (!model) {
+    return model;
+  }
+
+  return model.startsWith('LR/') ? model.slice(3) : model;
 }
 
 function buildTraceEvent(requestId: string, event: string, data: Record<string, unknown>) {
@@ -204,6 +213,30 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
         stream,
       }),
     );
+
+    const allowedModel = normalizeAllowedModel(model);
+    if (
+      allowedModel &&
+      deps.allowedModels &&
+      deps.allowedModels.size > 0 &&
+      !deps.allowedModels.has(model as string) &&
+      !deps.allowedModels.has(allowedModel)
+    ) {
+      deps.traceStore.appendEvent(
+        buildTraceEvent(requestId, 'request_rejected', {
+          model,
+          stream,
+          classification: 'model_not_allowed',
+        }),
+      );
+      return reply.code(400).send({
+        error: {
+          type: 'model_not_allowed',
+          message: 'Model is not configured in Q-router.',
+          model,
+        },
+      });
+    }
 
     let committed = false;
     let lastStatus: number | null = null;

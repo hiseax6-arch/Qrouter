@@ -153,6 +153,14 @@ function normalizeResponseInputContent(
   return [{ type: contentType, text: String(content ?? '') }];
 }
 
+function normalizeResponsesRole(role: unknown): 'assistant' | 'system' | 'developer' | 'user' {
+  if (role === 'assistant' || role === 'system' || role === 'developer' || role === 'user') {
+    return role;
+  }
+
+  return 'user';
+}
+
 function buildResponsesInput(messages: unknown): unknown {
   if (!Array.isArray(messages)) {
     return '';
@@ -161,7 +169,7 @@ function buildResponsesInput(messages: unknown): unknown {
   return messages
     .filter((message): message is Record<string, unknown> => Boolean(message) && typeof message === 'object')
     .map((message) => {
-      const role = typeof message.role === 'string' ? message.role : 'user';
+      const role = normalizeResponsesRole(message.role);
       return {
         type: 'message',
         role,

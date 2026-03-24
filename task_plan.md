@@ -57,38 +57,38 @@ The router must apply a **semantic success gate** before returning any upstream 
 - **Status:** in_progress
 
 ### Phase 3: Prototype Implementation
-- [ ] Create project structure for the local gateway
-- [ ] Implement `POST /v1/chat/completions`
-- [ ] Implement upstream forwarding to the real provider/base URL
-- [ ] Implement same-provider same-model retry logic
-- [ ] Implement explicit empty-success detection for non-streaming responses
-- [ ] Implement streaming handling and pre-commit buffer strategy
-- [ ] Return explicit structured errors when retries are exhausted
-- [ ] Add structured attempt logging / trace persistence
-- **Status:** pending
+- [x] Create project structure for the local gateway
+- [x] Implement `POST /v1/chat/completions`
+- [x] Implement upstream forwarding to the real provider/base URL
+- [x] Implement same-provider same-model retry logic
+- [x] Implement explicit empty-success detection for non-streaming responses
+- [x] Implement streaming handling and pre-commit buffer strategy
+- [x] Return explicit structured errors when retries are exhausted
+- [x] Add structured attempt logging / trace persistence
+- **Status:** complete
 
 ### Phase 4: Optional Responses Compatibility
-- [ ] Determine whether the target OpenClaw path truly requires `/v1/responses` for the chosen `gpt-5.4` configuration
-- [ ] If yes, implement a minimal compatible `/v1/responses` surface or response adapter
-- [ ] If no, document why `chat/completions` is sufficient for v1 and defer responses support
-- **Status:** pending
+- [x] Determine whether the target OpenClaw path truly requires `/v1/responses` for the chosen `gpt-5.4` configuration
+- [x] Decide v1 will not implement `/v1/responses`; instead, use a dedicated router provider configured with `api: "openai-completions"` for `qingfuCodex/gpt-5.4`
+- [x] Document why `chat/completions` is sufficient for v1 and defer responses support
+- **Status:** complete
 
 ### Phase 5: OpenClaw Integration
-- [ ] Add a dedicated OpenClaw provider entry pointing at the local router via `baseUrl`
-- [ ] Map `gpt-5.4` traffic to that provider cleanly
-- [ ] Verify a narrow integration path with one OpenClaw target configuration
-- [ ] Verify rollback path back to direct upstream
-- [ ] Document the exact config diff / rollback path
-- **Status:** pending
+- [x] Add a dedicated OpenClaw provider entry pointing at the local router via `baseUrl`
+- [x] Map `gpt-5.4` traffic to that provider cleanly
+- [x] Verify a narrow integration path with one OpenClaw target configuration
+- [x] Verify rollback path back to direct upstream
+- [x] Document the exact config diff / rollback path
+- **Status:** complete
 
 ### Phase 6: Verification & Hardening
-- [ ] Validate normal success path
-- [ ] Validate timeout retry path
-- [ ] Validate empty-success retry path
-- [ ] Validate streaming pre-commit / no-double-send behavior
-- [ ] Validate explicit failure after retry exhaustion
-- [ ] Validate logs/diagnostics are sufficient to explain what happened per request
-- **Status:** pending
+- [x] Validate normal success path
+- [x] Validate timeout retry path
+- [x] Validate empty-success retry path
+- [x] Validate streaming pre-commit / no-double-send behavior
+- [x] Validate explicit failure after retry exhaustion
+- [x] Validate logs/diagnostics are sufficient to explain what happened per request
+- **Status:** complete
 
 ### Phase 7: Delivery
 - [ ] Summarize architecture, assumptions, and constraints

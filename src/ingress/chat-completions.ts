@@ -1,0 +1,551 @@
+import type { FastifyReply, FastifyRequest } from 'fastify';
+import { randomUUID } from 'node:crypto';
+import { PassThrough } from 'node:stream';
+import {
+  classifyChatCompletionChunk,
+  classifyChatCompletionResult,
+} from '../domain/classify.js';
+import {
+  buildEmptySuccessFailure,
+  buildRetryExhaustedFailure,
+  buildStreamErrorEvent,
+  buildTerminalFailure,
+} from '../errors/terminal-payload.js';
+import type { TraceStore } from '../traces/store.js';
+import type { FetchUpstream } from '../upstream/client.js';
+
+export type RetryPolicy = {
+  maxAttempts: number;
+  backoffMs: (attempt: number, reason: string) => number;
+};
+
+export type ChatCompletionsDeps = {
+  fetchUpstream: FetchUpstream;
+  retryPolicy: RetryPolicy;
+  traceStore: TraceStore;
+};
+
+type ChatCompletionsRequestBody = {
+  model?: string;
+  stream?: boolean;
+  messages?: unknown[];
+};
+
+type StreamProbeResult =
+  | {
+      kind: 'semantic_success';
+      bufferedChunks: string[];
+      iterator: AsyncIterator<string>;
+      reason: string;
+    }
+  | { kind: 'empty_success'; bufferedChunks: string[]; reason: 'no_semantic_payload' };
+
+function sleep(ms: number): Promise<void> {
+  if (ms <= 0) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function shouldRetryStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+function classifyThrownUpstreamError(error: unknown): 'timeout' | 'connection_error' {
+  if (!error || typeof error !== 'object') {
+    return 'connection_error';
+  }
+
+  const record = error as { name?: string; code?: string; message?: string };
+  const name = String(record.name ?? '').toLowerCase();
+  const code = String(record.code ?? '').toUpperCase();
+  const message = String(record.message ?? '').toLowerCase();
+
+  if (
+    name.includes('timeout') ||
+    name === 'aborterror' ||
+    code === 'ETIMEDOUT' ||
+    code === 'UND_ERR_CONNECT_TIMEOUT' ||
+    code === 'ABORT_ERR' ||
+    message.includes('timed out') ||
+    message.includes('timeout')
+  ) {
+    return 'timeout';
+  }
+
+  return 'connection_error';
+}
+
+function isStreamingRequest(body: ChatCompletionsRequestBody): boolean {
+  return body.stream === true;
+}
+
+function buildTraceEvent(requestId: string, event: string, data: Record<string, unknown>) {
+  return {
+    timestamp: new Date().toISOString(),
+    requestId,
+    event,
+    ...data,
+  };
+}
+
+async function probeStreamingPreCommit(
+  textStream: AsyncIterable<string>,
+): Promise<StreamProbeResult> {
+  const iterator = textStream[Symbol.asyncIterator]();
+  const bufferedChunks: string[] = [];
+  let lineBuffer = '';
+
+  while (true) {
+    const next = await iterator.next();
+    if (next.done) {
+      return {
+        kind: 'empty_success',
+        bufferedChunks,
+        reason: 'no_semantic_payload',
+      };
+    }
+
+    const chunk = next.value;
+    bufferedChunks.push(chunk);
+    lineBuffer += chunk;
+
+    while (true) {
+      const newlineIndex = lineBuffer.indexOf('\n');
+      if (newlineIndex === -1) {
+        break;
+      }
+
+      const rawLine = lineBuffer.slice(0, newlineIndex);
+      lineBuffer = lineBuffer.slice(newlineIndex + 1);
+      const line = rawLine.trim();
+
+      if (!line.startsWith('data:')) {
+        continue;
+      }
+
+      const data = line.slice(5).trim();
+      if (!data || data === '[DONE]') {
+        continue;
+      }
+
+      try {
+        const parsed = JSON.parse(data);
+        const classification = classifyChatCompletionChunk(parsed);
+        if (classification.kind === 'semantic_success') {
+          return {
+            kind: 'semantic_success',
+            bufferedChunks,
+            iterator,
+            reason: classification.reason,
+          };
+        }
+      } catch {
+        // Ignore incomplete/non-JSON lines and keep buffering.
+      }
+    }
+  }
+}
+
+async function forwardCommittedStream(args: {
+  reply: FastifyReply;
+  contentType: string;
+  bufferedChunks: string[];
+  iterator: AsyncIterator<string>;
+  onPostCommitError: (errorClass: string) => void;
+  requestId: string;
+  attempts: number;
+}) {
+  const downstream = new PassThrough();
+  args.reply.header('content-type', args.contentType);
+  args.reply.header('cache-control', 'no-cache');
+  args.reply.send(downstream);
+
+  for (const chunk of args.bufferedChunks) {
+    downstream.write(chunk);
+  }
+
+  try {
+    while (true) {
+      const next = await args.iterator.next();
+      if (next.done) {
+        break;
+      }
+      downstream.write(next.value);
+    }
+  } catch {
+    args.onPostCommitError('stream_interrupted_after_commit');
+    downstream.write(
+      buildStreamErrorEvent({
+        requestId: args.requestId,
+        attempts: args.attempts,
+        finalErrorClass: 'stream_interrupted_after_commit',
+      }),
+    );
+  } finally {
+    downstream.end();
+  }
+}
+
+export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
+  return async function handleChatCompletions(
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ) {
+    const requestId = randomUUID();
+    const body = (request.body ?? {}) as ChatCompletionsRequestBody;
+    const model = body.model ?? null;
+    const stream = isStreamingRequest(body);
+
+    deps.traceStore.appendEvent(
+      buildTraceEvent(requestId, 'request_received', {
+        model,
+        stream,
+      }),
+    );
+
+    let committed = false;
+    let lastStatus: number | null = null;
+    let finalClassification = 'unknown';
+    let errorClass: string | null = null;
+    let attemptsUsed = 0;
+
+    for (let attempt = 1; attempt <= deps.retryPolicy.maxAttempts; attempt += 1) {
+      attemptsUsed = attempt;
+      deps.traceStore.appendEvent(
+        buildTraceEvent(requestId, 'attempt_started', {
+          attempt,
+          model,
+          stream,
+        }),
+      );
+
+      try {
+        const upstream = await deps.fetchUpstream({ body, requestId, attempt });
+        lastStatus = upstream.status;
+
+        deps.traceStore.appendEvent(
+          buildTraceEvent(requestId, 'upstream_response', {
+            attempt,
+            model,
+            stream,
+            status: upstream.status,
+          }),
+        );
+
+        if (upstream.status >= 200 && upstream.status < 300) {
+          if (stream) {
+            if (!upstream.textStream) {
+              finalClassification = 'malformed_success';
+              errorClass = 'malformed_success';
+            } else {
+              const probe = await probeStreamingPreCommit(upstream.textStream);
+
+              if (probe.kind === 'semantic_success') {
+                committed = true;
+                finalClassification = 'semantic_success';
+                deps.traceStore.appendEvent(
+                  buildTraceEvent(requestId, 'semantic_success', {
+                    attempt,
+                    model,
+                    stream,
+                    classification: probe.reason,
+                    committed: true,
+                  }),
+                );
+
+                await forwardCommittedStream({
+                  reply,
+                  contentType:
+                    upstream.headers['content-type'] ?? 'text/event-stream; charset=utf-8',
+                  bufferedChunks: probe.bufferedChunks,
+                  iterator: probe.iterator,
+                  requestId,
+                  attempts: attempt,
+                  onPostCommitError: (postCommitErrorClass) => {
+                    finalClassification = 'post_commit_interrupted';
+                    errorClass = postCommitErrorClass;
+                    deps.traceStore.appendEvent(
+                      buildTraceEvent(requestId, 'post_commit_error', {
+                        attempt,
+                        model,
+                        stream,
+                        classification: postCommitErrorClass,
+                      }),
+                    );
+                  },
+                });
+
+                deps.traceStore.recordSummary({
+                  requestId,
+                  model,
+                  stream,
+                  attempts: attempt,
+                  finalClassification,
+                  committed,
+                  lastStatus,
+                  errorClass,
+                  createdAt: new Date().toISOString(),
+                });
+                deps.traceStore.appendEvent(
+                  buildTraceEvent(requestId, 'request_completed', {
+                    attempt,
+                    model,
+                    stream,
+                    classification: finalClassification,
+                    committed,
+                  }),
+                );
+                return reply;
+              }
+
+              finalClassification = 'empty_success';
+              errorClass = 'empty_success';
+              deps.traceStore.appendEvent(
+                buildTraceEvent(requestId, 'retry_scheduled', {
+                  attempt,
+                  model,
+                  stream,
+                  classification: 'empty_success',
+                }),
+              );
+            }
+          } else {
+            const payload = await upstream.json();
+            const classification = classifyChatCompletionResult(
+              payload as Parameters<typeof classifyChatCompletionResult>[0],
+            );
+
+            if (classification.kind === 'semantic_success') {
+              finalClassification = 'semantic_success';
+              deps.traceStore.appendEvent(
+                buildTraceEvent(requestId, 'semantic_success', {
+                  attempt,
+                  model,
+                  stream,
+                  classification: classification.reason,
+                  committed: false,
+                }),
+              );
+              deps.traceStore.recordSummary({
+                requestId,
+                model,
+                stream,
+                attempts: attempt,
+                finalClassification,
+                committed,
+                lastStatus,
+                errorClass,
+                createdAt: new Date().toISOString(),
+              });
+              deps.traceStore.appendEvent(
+                buildTraceEvent(requestId, 'request_completed', {
+                  attempt,
+                  model,
+                  stream,
+                  classification: finalClassification,
+                  committed,
+                }),
+              );
+              return reply.code(200).send(payload);
+            }
+
+            finalClassification = 'empty_success';
+            errorClass = 'empty_success';
+            deps.traceStore.appendEvent(
+              buildTraceEvent(requestId, 'retry_scheduled', {
+                attempt,
+                model,
+                stream,
+                classification: classification.kind,
+              }),
+            );
+          }
+
+          if (attempt < deps.retryPolicy.maxAttempts) {
+            await sleep(deps.retryPolicy.backoffMs(attempt, finalClassification));
+            continue;
+          }
+
+          deps.traceStore.recordSummary({
+            requestId,
+            model,
+            stream,
+            attempts: attempt,
+            finalClassification,
+            committed,
+            lastStatus,
+            errorClass,
+            createdAt: new Date().toISOString(),
+          });
+          deps.traceStore.appendEvent(
+            buildTraceEvent(requestId, 'request_completed', {
+              attempt,
+              model,
+              stream,
+              classification: finalClassification,
+              committed,
+            }),
+          );
+          return reply.code(502).send(
+            buildEmptySuccessFailure({
+              requestId,
+              attempts: attempt,
+            }),
+          );
+        }
+
+        if (shouldRetryStatus(upstream.status)) {
+          finalClassification = `http_${upstream.status}`;
+          errorClass = finalClassification;
+          deps.traceStore.appendEvent(
+            buildTraceEvent(requestId, 'retry_scheduled', {
+              attempt,
+              model,
+              stream,
+              classification: finalClassification,
+            }),
+          );
+
+          if (attempt < deps.retryPolicy.maxAttempts) {
+            await sleep(deps.retryPolicy.backoffMs(attempt, finalClassification));
+            continue;
+          }
+
+          deps.traceStore.recordSummary({
+            requestId,
+            model,
+            stream,
+            attempts: attempt,
+            finalClassification,
+            committed,
+            lastStatus,
+            errorClass,
+            createdAt: new Date().toISOString(),
+          });
+          deps.traceStore.appendEvent(
+            buildTraceEvent(requestId, 'request_completed', {
+              attempt,
+              model,
+              stream,
+              classification: finalClassification,
+              committed,
+            }),
+          );
+          return reply.code(502).send(
+            buildRetryExhaustedFailure({
+              requestId,
+              attempts: attempt,
+              finalErrorClass: finalClassification,
+            }),
+          );
+        }
+
+        finalClassification = `http_${upstream.status}`;
+        errorClass = finalClassification;
+        deps.traceStore.recordSummary({
+          requestId,
+          model,
+          stream,
+          attempts: attempt,
+          finalClassification,
+          committed,
+          lastStatus,
+          errorClass,
+          createdAt: new Date().toISOString(),
+        });
+        deps.traceStore.appendEvent(
+          buildTraceEvent(requestId, 'request_completed', {
+            attempt,
+            model,
+            stream,
+            classification: finalClassification,
+            committed,
+          }),
+        );
+        return reply.code(upstream.status).send(
+          buildTerminalFailure({
+            requestId,
+            attempts: attempt,
+            finalErrorClass: finalClassification,
+          }),
+        );
+      } catch (error) {
+        finalClassification = classifyThrownUpstreamError(error);
+        errorClass = finalClassification;
+        deps.traceStore.appendEvent(
+          buildTraceEvent(requestId, 'retry_scheduled', {
+            attempt,
+            model,
+            stream,
+            classification: finalClassification,
+          }),
+        );
+
+        if (attempt < deps.retryPolicy.maxAttempts) {
+          await sleep(deps.retryPolicy.backoffMs(attempt, finalClassification));
+          continue;
+        }
+
+        deps.traceStore.recordSummary({
+          requestId,
+          model,
+          stream,
+          attempts: attempt,
+          finalClassification,
+          committed,
+          lastStatus,
+          errorClass,
+          createdAt: new Date().toISOString(),
+        });
+        deps.traceStore.appendEvent(
+          buildTraceEvent(requestId, 'request_completed', {
+            attempt,
+            model,
+            stream,
+            classification: finalClassification,
+            committed,
+          }),
+        );
+        return reply.code(502).send(
+          buildRetryExhaustedFailure({
+            requestId,
+            attempts: attempt,
+            finalErrorClass: finalClassification,
+          }),
+        );
+      }
+    }
+
+    deps.traceStore.recordSummary({
+      requestId,
+      model,
+      stream,
+      attempts: attemptsUsed,
+      finalClassification,
+      committed,
+      lastStatus,
+      errorClass,
+      createdAt: new Date().toISOString(),
+    });
+    deps.traceStore.appendEvent(
+      buildTraceEvent(requestId, 'request_completed', {
+        attempt: attemptsUsed,
+        model,
+        stream,
+        classification: finalClassification,
+        committed,
+      }),
+    );
+    return reply.code(500).send({
+      error: {
+        message: 'Router exhausted control flow unexpectedly.',
+        type: 'router_internal_error',
+        request_id: requestId,
+        attempts: attemptsUsed,
+        final_error_class: finalClassification,
+      },
+    });
+  };
+}

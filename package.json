@@ -1,0 +1,27 @@
+{
+  "name": "qingfu-router",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "preview:openclaw": "tsx src/integration/preview.ts",
+    "preview:openclaw:rollback": "tsx src/integration/preview.ts /home/seax/.openclaw/openclaw.json rollback",
+    "verify:phase6": "vitest run src/tests/integration.test.ts src/tests/openclaw-config.test.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "fastify": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.13.14",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.8"
+  }
+}

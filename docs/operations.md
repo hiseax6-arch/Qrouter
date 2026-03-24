@@ -13,7 +13,8 @@ This document is the operator runbook for starting, verifying, troubleshooting, 
 ### Start
 Expected future command shape (draft):
 ```bash
-pnpm start
+npm run build
+npm start
 # or
 node dist/server.js
 ```
@@ -98,7 +99,8 @@ Expected use:
 - `http_429`
 - `http_5xx`
 - `terminal_client_error`
-- `post_commit_stream_failure`
+- `post_commit_interrupted`
+- post-commit error detail: `stream_interrupted_after_commit`
 
 ## Operator Questions During Incident Review
 - Did the router see the request at all?
@@ -111,22 +113,52 @@ Expected use:
 ## Rollout Runbook
 ### Narrow rollout
 1. start router locally,
-2. point one provider path at router,
-3. send one controlled request,
-4. verify traces,
-5. verify OpenClaw receives either semantic success or explicit failure.
+2. preview the candidate OpenClaw patch:
+   ```bash
+   npm run preview:openclaw -- /home/seax/.openclaw/openclaw.json
+   ```
+3. add the dedicated provider entry `qingfuCodex` with `api: "openai-completions"`,
+4. set primary model to `qingfuCodex/gpt-5.4`,
+5. preserve `codex/gpt-5.4` as fallback,
+6. send one controlled request,
+7. verify traces,
+8. verify OpenClaw receives either semantic success or explicit failure.
 
-### Expansion
-- add more traffic only after the narrow path is stable,
-- keep rollback instructions nearby,
-- review trace patterns before widening rollout.
+## Exact Config Diff (Narrow Rollout)
+### Paths changed by apply step
+- `env.QINGFU_ROUTER_API_KEY`
+- `models.providers.qingfuCodex`
+- `agents.defaults.model.primary`
+- `agents.defaults.model.fallbacks`
+- `agents.defaults.models.qingfuCodex/gpt-5.4`
+
+### Resulting target state
+- `primary = "qingfuCodex/gpt-5.4"`
+- `fallbacks = ["codex/gpt-5.4"]`
+- `models.providers.qingfuCodex.api = "openai-completions"`
+- `models.providers.qingfuCodex.baseUrl = "http://127.0.0.1:4318/v1"`
 
 ## Rollback Runbook
 ### Immediate rollback
-1. restore original OpenClaw provider/baseUrl,
-2. reload or restart the affected runtime if needed,
-3. confirm new requests no longer hit qingfu-router,
-4. preserve trace artifacts for postmortem.
+1. preview the rollback candidate:
+   ```bash
+   npm run preview:openclaw -- /home/seax/.openclaw/openclaw.json rollback
+   ```
+2. restore `agents.defaults.model.primary` to `codex/gpt-5.4`,
+3. remove `codex/gpt-5.4` from fallback position if it was only inserted for qingfu-router rollout,
+4. remove `models.providers.qingfuCodex`,
+5. remove `agents.defaults.models["qingfuCodex/gpt-5.4"]`,
+6. optionally remove `env.QINGFU_ROUTER_API_KEY` if it was added only for this rollout,
+7. reload or restart the affected runtime if needed,
+8. confirm new requests no longer hit qingfu-router,
+9. preserve trace artifacts for postmortem.
+
+### Paths changed by rollback step
+- `agents.defaults.model.primary`
+- `agents.defaults.model.fallbacks`
+- `models.providers.qingfuCodex`
+- `agents.defaults.models.qingfuCodex/gpt-5.4`
+- optional: `env.QINGFU_ROUTER_API_KEY`
 
 ## Pre-Release Test Checklist
 - non-stream success works,
@@ -136,6 +168,7 @@ Expected use:
 - stream closes before commit and gets retried,
 - stream with real content commits once,
 - exhausted empty-success returns explicit failure,
+- apply/rollback config preview matches the intended diff,
 - rollback path works cleanly.
 
 ## Future Operations Enhancements

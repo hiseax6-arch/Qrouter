@@ -1,2 +1,5 @@
 
 .worktrees/
+node_modules/
+dist/
+.qingfu-router/

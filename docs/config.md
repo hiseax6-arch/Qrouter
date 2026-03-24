@@ -19,8 +19,9 @@ Suggested env vars:
 - `QINGFU_ROUTER_API_KEY` (optional local guard)
 - `QINGFU_UPSTREAM_BASE_URL`
 - `QINGFU_UPSTREAM_API_KEY`
+- `QINGFU_UPSTREAM_TIMEOUT_MS`
 - `QINGFU_TRACE_DIR`
-- `QINGFU_SQLITE_PATH`
+- `QINGFU_TRACE_SQLITE_PATH`
 
 ### 2. Local config file
 Good for stable, non-secret policy settings.
@@ -66,7 +67,7 @@ Suggested contents:
   },
   traces: {
     jsonlDir: "${QINGFU_TRACE_DIR}",
-    sqlitePath: "${QINGFU_SQLITE_PATH}",
+    sqlitePath: "${QINGFU_TRACE_SQLITE_PATH}",
     logRequestBodies: false,
     logResponseBodies: false
   }
@@ -112,21 +113,52 @@ Use a dedicated provider entry pointing at qingfu-router.
   models: {
     providers: {
       qingfuCodex: {
-        api: "openai-chat-completions",
+        api: "openai-completions",
+        auth: "api-key",
+        apiKey: "${QINGFU_ROUTER_API_KEY}",
+        authHeader: true,
         baseUrl: "http://127.0.0.1:4318/v1",
-        envKey: "QINGFU_ROUTER_API_KEY"
+        models: [
+          { id: "gpt-5.4", name: "GPT-5.4 via Qingfu Router" }
+        ]
       }
     }
   },
   agents: {
     defaults: {
-      model: { primary: "qingfuCodex/gpt-5.4" }
+      model: {
+        primary: "qingfuCodex/gpt-5.4",
+        fallbacks: ["codex/gpt-5.4"]
+      },
+      models: {
+        "qingfuCodex/gpt-5.4": {
+          alias: "GPT-5.4 via Qingfu Router"
+        }
+      }
     }
   }
 }
 ```
 
-> Final schema may need adjustment after validating the exact OpenClaw provider format used in this installation.
+> This is intentionally a **dedicated custom provider entry**, not an in-place overwrite of the current `codex` provider.
+
+## Responses Compatibility Decision
+### Current installation reality
+The current live OpenClaw provider entry `codex` is configured with:
+- `api: "openai-responses"`
+- `baseUrl: "https://codex.0u0o.com/v1"`
+- model `gpt-5.4`
+
+That means **if we only swapped `baseUrl` on the existing `codex` provider**, qingfu-router would indeed need a `/v1/responses` surface.
+
+### V1 decision
+V1 avoids that requirement by introducing a **new dedicated provider entry** for the router:
+- provider id: `qingfuCodex`
+- api: `openai-completions`
+- baseUrl: local qingfu-router `/v1`
+- model path: `qingfuCodex/gpt-5.4`
+
+This keeps qingfu-router aligned with the already-implemented `/v1/chat/completions` path and makes rollout/rollback cleaner. `/v1/responses` remains explicitly deferred until a later phase proves it is worth the added compatibility cost.
 
 ## Rollout Strategy
 ### Narrow rollout

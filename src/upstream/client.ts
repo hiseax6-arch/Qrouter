@@ -13,6 +13,9 @@ export type UpstreamResponse = {
   json(): Promise<unknown>;
   textStream?: AsyncIterable<string>;
   usage?(): Promise<TokenUsage | null>;
+  bodyText?(): Promise<string>;
+  providerId?: string;
+  upstreamUrl?: string;
 };
 
 export type FetchUpstreamArgs = {
@@ -600,6 +603,16 @@ function createLazyPayloadLoader(response: Response): () => Promise<unknown> {
   };
 }
 
+function createLazyTextLoader(response: Response): () => Promise<string> {
+  let textPromise: Promise<string> | undefined;
+  return () => {
+    if (!textPromise) {
+      textPromise = response.text();
+    }
+    return textPromise;
+  };
+}
+
 function createOpenAICompletionsFetch(provider: RouterProviderConfig, timeoutMs: number): FetchUpstream {
   if (!provider.baseUrl) {
     throw new Error('Provider baseUrl is required for openai-completions upstreams.');
@@ -609,19 +622,20 @@ function createOpenAICompletionsFetch(provider: RouterProviderConfig, timeoutMs:
 
   return async ({ body, requestId }) => {
     const requestBody = body as Record<string, unknown>;
+    const upstreamUrl = `${baseUrl.replace(/\/$/, '')}/chat/completions`;
     const upstreamBody = {
       ...requestBody,
       model: stripLrPrefix(requestBody.model),
     };
 
     const response = await fetchJsonUpstream({
-      url: `${baseUrl.replace(/\/$/, '')}/chat/completions`,
+      url: upstreamUrl,
       headers: buildRequestHeaders(provider, requestId),
       body: upstreamBody,
       timeoutMs,
     });
-    const cloned = response.clone();
-    const loadPayload = createLazyPayloadLoader(cloned);
+    const loadPayload = createLazyPayloadLoader(response.clone());
+    const loadBodyText = createLazyTextLoader(response.clone());
     const streaming = streamRequested(requestBody);
 
     return {
@@ -630,6 +644,8 @@ function createOpenAICompletionsFetch(provider: RouterProviderConfig, timeoutMs:
       json: async () => loadPayload(),
       textStream: response.body ? readableStreamToTextChunks(response.body) : undefined,
       usage: streaming ? undefined : async () => extractTokenUsageFromPayload(await loadPayload()),
+      bodyText: async () => loadBodyText(),
+      upstreamUrl,
     };
   };
 }
@@ -645,6 +661,7 @@ function createOpenAIResponsesFetch(provider: RouterProviderConfig, timeoutMs: n
     const requestBody = body as Record<string, unknown>;
     const model = stripLrPrefix(requestBody.model) ?? '';
     const normalizedTools = normalizeResponsesTools(requestBody.tools);
+    const upstreamUrl = `${baseUrl.replace(/\/$/, '')}/responses`;
     const upstreamBody = {
       model,
       input: buildResponsesInput(requestBody.messages),
@@ -657,13 +674,14 @@ function createOpenAIResponsesFetch(provider: RouterProviderConfig, timeoutMs: n
     };
 
     const response = await fetchJsonUpstream({
-      url: `${baseUrl.replace(/\/$/, '')}/responses`,
+      url: upstreamUrl,
       headers: buildRequestHeaders(provider, requestId),
       body: upstreamBody,
       timeoutMs,
     });
 
-    const loadPayload = createLazyPayloadLoader(response);
+    const loadPayload = createLazyPayloadLoader(response.clone());
+    const loadBodyText = createLazyTextLoader(response.clone());
     const headers = streamRequested(requestBody)
       ? { 'content-type': 'text/event-stream; charset=utf-8' }
       : { 'content-type': 'application/json; charset=utf-8' };
@@ -676,6 +694,8 @@ function createOpenAIResponsesFetch(provider: RouterProviderConfig, timeoutMs: n
         ? adaptResponsesPayloadToChatCompletionsStream(loadPayload(), model)
         : undefined,
       usage: async () => extractTokenUsageFromPayload(await loadPayload()),
+      bodyText: async () => loadBodyText(),
+      upstreamUrl,
     };
   };
 }
@@ -720,15 +740,23 @@ export function createProviderAwareFetch(
     };
 
     if (provider.api === 'openai-responses') {
-      return createOpenAIResponsesFetch(provider, fallback.timeoutMs)({
+      const upstream = await createOpenAIResponsesFetch(provider, fallback.timeoutMs)({
         ...args,
         body: upstreamBody,
       });
+      return {
+        ...upstream,
+        providerId: selection.providerId,
+      };
     }
 
-    return createOpenAICompletionsFetch(provider, fallback.timeoutMs)({
+    const upstream = await createOpenAICompletionsFetch(provider, fallback.timeoutMs)({
       ...args,
       body: upstreamBody,
     });
+    return {
+      ...upstream,
+      providerId: selection.providerId,
+    };
   };
 }

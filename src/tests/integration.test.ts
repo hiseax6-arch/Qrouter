@@ -187,6 +187,80 @@ describe('POST /v1/chat/completions', () => {
     });
   });
 
+  test('retries 403 usage-limit responses and returns the later semantic success', async () => {
+    let attempts = 0;
+    const app = buildApp({
+      traceStore: createNoopTraceStore(),
+      retryPolicy: {
+        maxAttempts: 2,
+        backoffMs: () => 0,
+      },
+      fetchUpstream: async () => {
+        attempts += 1;
+
+        if (attempts === 1) {
+          return {
+            status: 403,
+            headers: {},
+            json: async () => ({
+              error: {
+                type: 'usage_limit_reached',
+                message: 'The usage limit has been reached',
+              },
+            }),
+            bodyText: async () => JSON.stringify({
+              error: {
+                type: 'usage_limit_reached',
+                message: 'The usage limit has been reached',
+              },
+            }),
+          };
+        }
+
+        return {
+          status: 200,
+          headers: {},
+          json: async () => ({
+            id: 'resp-usage-recovered',
+            choices: [
+              {
+                message: {
+                  role: 'assistant',
+                  content: 'recovered after transient quota gate',
+                },
+              },
+            ],
+          }),
+        };
+      },
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-5.4',
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      id: 'resp-usage-recovered',
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: 'recovered after transient quota gate',
+          },
+        },
+      ],
+    });
+    expect(attempts).toBe(2);
+
+    await app.close();
+  });
+
   test('surfaces explicit failure when all attempts end as empty-success', async () => {
     let attempts = 0;
     const app = buildApp({
@@ -540,6 +614,91 @@ describe('POST /v1/chat/completions', () => {
       committed: 0,
       error_class: 'timeout',
     });
+  });
+
+  test('surfaces parsed upstream error details for non-retryable terminal failures', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'Q-router-terminal-error-'));
+    const jsonlPath = join(tempDir, 'events.jsonl');
+    const sqlitePath = join(tempDir, 'summaries.sqlite');
+    const traceStore = createTraceStore({ jsonlPath, sqlitePath });
+
+    const app = buildApp({
+      traceStore,
+      fetchUpstream: async () => ({
+        status: 403,
+        headers: {},
+        providerId: 'codex',
+        upstreamUrl: 'https://codex.example.test/v1/responses',
+        json: async () => ({
+          error: {
+            type: 'forbidden',
+            code: 'plan_forbidden',
+            message: 'Plan does not allow this model',
+          },
+        }),
+        bodyText: async () => JSON.stringify({
+          error: {
+            type: 'forbidden',
+            code: 'plan_forbidden',
+            message: 'Plan does not allow this model',
+          },
+        }),
+      }),
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-5.4',
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toEqual({
+      error: {
+        message: 'Upstream 403: Plan does not allow this model',
+        type: 'upstream_terminal_error',
+        request_id: expect.any(String),
+        attempts: 1,
+        final_error_class: 'http_403',
+        upstream_status: 403,
+        upstream_error: {
+          type: 'forbidden',
+          code: 'plan_forbidden',
+          message: 'Plan does not allow this model',
+          body_snippet: expect.stringContaining('plan_forbidden'),
+        },
+      },
+    });
+
+    await app.close();
+
+    const jsonl = readFileSync(jsonlPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    expect(jsonl).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event: 'upstream_response',
+          status: 403,
+          providerId: 'codex',
+          upstreamUrl: 'https://codex.example.test/v1/responses',
+        }),
+        expect.objectContaining({
+          event: 'upstream_error',
+          status: 403,
+          providerId: 'codex',
+          upstreamUrl: 'https://codex.example.test/v1/responses',
+          retryable: false,
+          upstreamErrorType: 'forbidden',
+          upstreamErrorCode: 'plan_forbidden',
+          upstreamErrorMessage: 'Plan does not allow this model',
+        }),
+      ]),
+    );
   });
 
   test('persists JSONL events and SQLite summaries for request forensics', async () => {

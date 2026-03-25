@@ -376,6 +376,10 @@ describe('provider-aware upstream routing', () => {
           request_id: expect.any(String),
           attempts: 1,
           final_error_class: 'http_401',
+          upstream_status: 401,
+          upstream_error: {
+            body_snippet: 'not-json',
+          },
         },
       });
       expect(unhandled).toEqual([]);

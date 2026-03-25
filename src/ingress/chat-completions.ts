@@ -47,6 +47,13 @@ type StreamProbeResult =
     }
   | { kind: 'empty_success'; bufferedChunks: string[]; reason: 'no_semantic_payload' };
 
+type UpstreamErrorDetails = {
+  type?: string;
+  code?: string;
+  message?: string;
+  bodySnippet?: string;
+};
+
 function sleep(ms: number): Promise<void> {
   if (ms <= 0) {
     return Promise.resolve();
@@ -55,8 +62,95 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function shouldRetryStatus(status: number): boolean {
-  return status === 429 || status >= 500;
+function truncateForTrace(value: string, maxLength = 240): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+
+  return `${value.slice(0, maxLength - 1)}...`;
+}
+
+function parseUpstreamErrorDetails(bodyText: string): UpstreamErrorDetails | null {
+  const trimmed = bodyText.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  let type: string | undefined;
+  let code: string | undefined;
+  let message: string | undefined;
+
+  try {
+    const parsed = JSON.parse(trimmed) as {
+      error?: { type?: unknown; code?: unknown; message?: unknown };
+      type?: unknown;
+      code?: unknown;
+      message?: unknown;
+    };
+    const source =
+      parsed.error && typeof parsed.error === 'object'
+        ? parsed.error
+        : parsed;
+    type = typeof source.type === 'string' ? source.type : undefined;
+    code = typeof source.code === 'string' ? source.code : undefined;
+    message = typeof source.message === 'string' ? source.message : undefined;
+  } catch {
+    // Keep a text snippet for non-JSON upstream failures.
+  }
+
+  const bodySnippet = truncateForTrace(trimmed, 400);
+  if (!type && !code && !message && !bodySnippet) {
+    return null;
+  }
+
+  return {
+    ...(type ? { type } : {}),
+    ...(code ? { code } : {}),
+    ...(message ? { message } : {}),
+    ...(bodySnippet ? { bodySnippet } : {}),
+  };
+}
+
+async function resolveUpstreamErrorDetails(upstream: UpstreamResponse): Promise<UpstreamErrorDetails | null> {
+  if (!upstream.bodyText) {
+    return null;
+  }
+
+  try {
+    return parseUpstreamErrorDetails(await upstream.bodyText());
+  } catch {
+    return null;
+  }
+}
+
+function shouldRetryStatus(status: number, errorDetails: UpstreamErrorDetails | null): boolean {
+  if (status === 429 || status >= 500) {
+    return true;
+  }
+
+  if (status !== 403 || !errorDetails) {
+    return false;
+  }
+
+  const retrySignals = [
+    errorDetails.type,
+    errorDetails.code,
+    errorDetails.message,
+    errorDetails.bodySnippet,
+  ]
+    .filter((value): value is string => typeof value === 'string' && value.length > 0)
+    .map((value) => value.toLowerCase());
+
+  return retrySignals.some((value) =>
+    value.includes('usage_limit_reached') ||
+    value.includes('usage limit has been reached') ||
+    value.includes('rate_limit') ||
+    value.includes('rate limit') ||
+    value.includes('temporarily unavailable') ||
+    value.includes('temporarily_unavailable') ||
+    value.includes('auth_unavailable') ||
+    value.includes('quota'),
+  );
 }
 
 function classifyThrownUpstreamError(error: unknown): 'timeout' | 'connection_error' {
@@ -319,6 +413,7 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
     let errorClass: string | null = null;
     let attemptsUsed = 0;
     let cumulativeTokenUsage: TokenUsage | null = null;
+    let lastUpstreamError: UpstreamErrorDetails | null = null;
 
     function recordSummary(attempts: number) {
       deps.traceStore.recordSummary({
@@ -361,6 +456,9 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
       try {
         const upstream = await deps.fetchUpstream({ body, requestId, attempt });
         lastStatus = upstream.status;
+        lastUpstreamError = upstream.status >= 400
+          ? await resolveUpstreamErrorDetails(upstream)
+          : null;
 
         deps.traceStore.appendEvent(
           buildTraceEvent(requestId, 'upstream_response', {
@@ -368,8 +466,28 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
             model,
             stream,
             status: upstream.status,
+            ...(upstream.providerId ? { providerId: upstream.providerId } : {}),
+            ...(upstream.upstreamUrl ? { upstreamUrl: upstream.upstreamUrl } : {}),
           }),
         );
+
+        if (lastUpstreamError) {
+          deps.traceStore.appendEvent(
+            buildTraceEvent(requestId, 'upstream_error', {
+              attempt,
+              model,
+              stream,
+              status: upstream.status,
+              retryable: shouldRetryStatus(upstream.status, lastUpstreamError),
+              ...(upstream.providerId ? { providerId: upstream.providerId } : {}),
+              ...(upstream.upstreamUrl ? { upstreamUrl: upstream.upstreamUrl } : {}),
+              ...(lastUpstreamError.type ? { upstreamErrorType: lastUpstreamError.type } : {}),
+              ...(lastUpstreamError.code ? { upstreamErrorCode: lastUpstreamError.code } : {}),
+              ...(lastUpstreamError.message ? { upstreamErrorMessage: lastUpstreamError.message } : {}),
+              ...(lastUpstreamError.bodySnippet ? { upstreamBodySnippet: lastUpstreamError.bodySnippet } : {}),
+            }),
+          );
+        }
 
         if (upstream.status >= 200 && upstream.status < 300) {
           let attemptTokenUsage: TokenUsage | null = null;
@@ -500,7 +618,7 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
           );
         }
 
-        if (shouldRetryStatus(upstream.status)) {
+        if (shouldRetryStatus(upstream.status, lastUpstreamError)) {
           finalClassification = `http_${upstream.status}`;
           errorClass = finalClassification;
           deps.traceStore.appendEvent(
@@ -524,6 +642,8 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
               requestId,
               attempts: attempt,
               finalErrorClass: finalClassification,
+              upstreamStatus: lastStatus,
+              upstreamError: lastUpstreamError,
             }),
           );
         }
@@ -537,6 +657,8 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
             requestId,
             attempts: attempt,
             finalErrorClass: finalClassification,
+            upstreamStatus: lastStatus,
+            upstreamError: lastUpstreamError,
           }),
         );
       } catch (error) {
@@ -563,6 +685,8 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
             requestId,
             attempts: attempt,
             finalErrorClass: finalClassification,
+            upstreamStatus: lastStatus,
+            upstreamError: lastUpstreamError,
           }),
         );
       }

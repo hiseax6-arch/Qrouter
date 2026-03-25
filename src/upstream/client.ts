@@ -1,4 +1,9 @@
-import type { RouterProviderConfig } from '../config/router.js';
+import type { RouterProviderConfig, RouterThinkingConfig } from '../config/router.js';
+import {
+  extractTokenUsageFromPayload,
+  toChatCompletionUsage,
+  type TokenUsage,
+} from '../domain/token-usage.js';
 
 const textDecoder = new TextDecoder();
 
@@ -7,6 +12,7 @@ export type UpstreamResponse = {
   headers: Record<string, string>;
   json(): Promise<unknown>;
   textStream?: AsyncIterable<string>;
+  usage?(): Promise<TokenUsage | null>;
 };
 
 export type FetchUpstreamArgs = {
@@ -31,6 +37,101 @@ type FallbackUpstreamConfig = {
   apiKey?: string;
   timeoutMs: number;
 };
+
+function hasNonEmptyTextPart(content: unknown): boolean {
+  if (typeof content === 'string') {
+    return content.trim().length > 0;
+  }
+
+  if (!Array.isArray(content)) {
+    return false;
+  }
+
+  return content.some((part) => {
+    if (typeof part === 'string') {
+      return part.trim().length > 0;
+    }
+
+    if (
+      part &&
+      typeof part === 'object' &&
+      'text' in part &&
+      typeof (part as { text?: unknown }).text === 'string'
+    ) {
+      return String((part as { text: string }).text).trim().length > 0;
+    }
+
+    return false;
+  });
+}
+
+function rewriteThinking(
+  body: Record<string, unknown>,
+  thinkingConfig: RouterThinkingConfig | undefined,
+): Record<string, unknown> {
+  const requestModel = typeof body.model === 'string' ? body.model : undefined;
+  const requestThinking = typeof body.thinking === 'string'
+    ? body.thinking
+    : typeof body.reasoning_effort === 'string'
+      ? body.reasoning_effort
+      : undefined;
+
+  if (!requestModel || !requestThinking) {
+    return body;
+  }
+
+  const normalizedModel = stripLrPrefix(requestModel) ?? requestModel;
+
+  if (thinkingConfig && thinkingConfig.defaultMode === 'pass-through') {
+    for (const rule of thinkingConfig.mappings ?? []) {
+      const matches = rule.match ?? [];
+      const hit = matches.includes(requestModel) || matches.includes(normalizedModel);
+      if (!hit) {
+        continue;
+      }
+      if (rule.when?.thinking && rule.when.thinking !== requestThinking) {
+        continue;
+      }
+
+      const nextBody = { ...body };
+      delete nextBody.thinking;
+      delete nextBody.reasoning_effort;
+
+      if (rule.rewrite?.reasoning && typeof rule.rewrite.reasoning === 'object') {
+        return {
+          ...nextBody,
+          reasoning: rule.rewrite.reasoning,
+        };
+      }
+
+      if (rule.rewrite?.thinking && rule.rewrite.thinking !== requestThinking) {
+        return {
+          ...nextBody,
+          reasoning: { effort: rule.rewrite.thinking },
+        };
+      }
+
+      return {
+        ...nextBody,
+        reasoning: { effort: requestThinking },
+      };
+    }
+  }
+
+  if (typeof body.reasoning_effort === 'string') {
+    const nextBody = { ...body };
+    delete nextBody.reasoning_effort;
+    if (!nextBody.reasoning || typeof nextBody.reasoning !== 'object') {
+      return {
+        ...nextBody,
+        reasoning: { effort: requestThinking },
+      };
+    }
+    return nextBody;
+  }
+
+  return body;
+}
 
 async function* readableStreamToTextChunks(
   stream: ReadableStream<Uint8Array>,
@@ -75,21 +176,49 @@ function stripProviderPrefix(modelId: string, providerId: string): string {
   return modelId.startsWith(prefix) ? modelId.slice(prefix.length) : modelId;
 }
 
+function withProviderPrefix(providerId: string, modelId: string): string {
+  return modelId.startsWith(`${providerId}/`) ? modelId : `${providerId}/${modelId}`;
+}
+
 function resolveProviderSelection(
   model: unknown,
   providers: Record<string, RouterProviderConfig>,
 ): ProviderSelection | null {
-  const requestModel = stripLrPrefix(model);
-  if (!requestModel) {
+  if (typeof model !== 'string') {
     return null;
   }
+
+  const rawRequestModel = model;
+  const requestModel = stripLrPrefix(model) ?? model;
+  let implicitMatch: ProviderSelection | null = null;
 
   for (const [providerId, provider] of Object.entries(providers)) {
     for (const modelEntry of provider.models ?? []) {
       const configuredModel = modelEntry.id;
       const upstreamModel = stripProviderPrefix(configuredModel, providerId);
-      if (requestModel === configuredModel || requestModel === upstreamModel) {
+      const explicitAliases = new Set([
+        withProviderPrefix(providerId, configuredModel),
+        withProviderPrefix(providerId, upstreamModel),
+      ]);
+      if (explicitAliases.has(rawRequestModel) || explicitAliases.has(requestModel)) {
         return {
+          providerId,
+          provider,
+          requestModel,
+          upstreamModel,
+        };
+      }
+
+      if (
+        !implicitMatch &&
+        (
+          rawRequestModel === configuredModel ||
+          rawRequestModel === upstreamModel ||
+          requestModel === configuredModel ||
+          requestModel === upstreamModel
+        )
+      ) {
+        implicitMatch = {
           providerId,
           provider,
           requestModel,
@@ -99,19 +228,40 @@ function resolveProviderSelection(
     }
   }
 
-  return null;
+  return implicitMatch;
 }
 
 function buildRequestHeaders(
   provider: RouterProviderConfig,
   requestId: string,
 ): Record<string, string> {
-  return {
+  const headers: Record<string, string> = {
     'content-type': 'application/json',
     'x-qingfu-request-id': requestId,
     ...(provider.headers ?? {}),
-    ...(provider.apiKey ? { authorization: `Bearer ${provider.apiKey}` } : {}),
   };
+
+  if (!provider.apiKey) {
+    return headers;
+  }
+
+  const authHeaders =
+    provider.authHeader === true || provider.auth === 'token' || provider.auth === 'oauth'
+      ? { authorization: `Bearer ${provider.apiKey}` }
+      : provider.auth === 'api-key'
+        ? { 'x-api-key': provider.apiKey }
+        : { authorization: `Bearer ${provider.apiKey}` };
+
+  for (const [key, value] of Object.entries(authHeaders)) {
+    const existingKey = Object.keys(headers).find(
+      (headerName) => headerName.toLowerCase() === key.toLowerCase(),
+    );
+    if (!existingKey) {
+      headers[key] = value;
+    }
+  }
+
+  return headers;
 }
 
 function createAbortController(timeoutMs: number) {
@@ -161,21 +311,109 @@ function normalizeResponsesRole(role: unknown): 'assistant' | 'system' | 'develo
   return 'user';
 }
 
-function buildResponsesInput(messages: unknown): unknown {
+function normalizeResponsesTools(tools: unknown): unknown[] | undefined {
+  if (!Array.isArray(tools)) {
+    return undefined;
+  }
+
+  return tools.map((tool) => {
+    if (!tool || typeof tool !== 'object') {
+      return tool;
+    }
+
+    const record = tool as Record<string, unknown>;
+    if (record.type !== 'function' || !record.function || typeof record.function !== 'object') {
+      return tool;
+    }
+
+    const fn = record.function as Record<string, unknown>;
+    return {
+      type: 'function',
+      ...(typeof fn.name === 'string' ? { name: fn.name } : {}),
+      ...(typeof fn.description === 'string' ? { description: fn.description } : {}),
+      ...(fn.parameters !== undefined ? { parameters: fn.parameters } : {}),
+      ...(fn.strict !== undefined ? { strict: fn.strict } : {}),
+    };
+  });
+}
+
+type ResponsesMessageInputItem = {
+  type: 'message';
+  role: 'assistant' | 'system' | 'developer' | 'user';
+  content: Array<{ type: 'input_text' | 'output_text'; text: string }>;
+};
+
+type ResponsesFunctionCallItem = {
+  type: 'function_call';
+  call_id: string;
+  name: string;
+  arguments: string;
+};
+
+type ResponsesFunctionCallOutputItem = {
+  type: 'function_call_output';
+  call_id: string;
+  output: string;
+};
+
+function buildResponsesInput(messages: unknown): Array<
+  ResponsesMessageInputItem | ResponsesFunctionCallItem | ResponsesFunctionCallOutputItem
+> | string {
   if (!Array.isArray(messages)) {
     return '';
   }
 
-  return messages
-    .filter((message): message is Record<string, unknown> => Boolean(message) && typeof message === 'object')
-    .map((message) => {
-      const role = normalizeResponsesRole(message.role);
-      return {
-        type: 'message',
-        role,
-        content: normalizeResponseInputContent(role, message.content),
-      };
+  const items: Array<ResponsesMessageInputItem | ResponsesFunctionCallItem | ResponsesFunctionCallOutputItem> = [];
+
+  for (const message of messages.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === 'object')) {
+    if (message.role === 'tool') {
+      items.push({
+        type: 'function_call_output',
+        call_id: typeof message.tool_call_id === 'string' ? message.tool_call_id : '',
+        output: typeof message.content === 'string' ? message.content : JSON.stringify(message.content ?? ''),
+      });
+      continue;
+    }
+
+    if (message.role === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      if (hasNonEmptyTextPart(message.content)) {
+        items.push({
+          type: 'message',
+          role: 'assistant',
+          content: normalizeResponseInputContent('assistant', message.content),
+        });
+      }
+
+      for (const toolCall of message.tool_calls.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === 'object')) {
+        items.push({
+          type: 'function_call',
+          call_id: typeof toolCall.id === 'string' ? toolCall.id : '',
+          name:
+            toolCall.function &&
+            typeof toolCall.function === 'object' &&
+            typeof (toolCall.function as Record<string, unknown>).name === 'string'
+              ? String((toolCall.function as Record<string, unknown>).name)
+              : '',
+          arguments:
+            toolCall.function &&
+            typeof toolCall.function === 'object' &&
+            typeof (toolCall.function as Record<string, unknown>).arguments === 'string'
+              ? String((toolCall.function as Record<string, unknown>).arguments)
+              : '',
+        });
+      }
+      continue;
+    }
+
+    const role = normalizeResponsesRole(message.role);
+    items.push({
+      type: 'message',
+      role,
+      content: normalizeResponseInputContent(role, message.content),
     });
+  }
+
+  return items;
 }
 
 function extractResponsesOutputText(payload: unknown): string {
@@ -215,9 +453,42 @@ function extractResponsesOutputText(payload: unknown): string {
   return parts.join('');
 }
 
+function extractResponsesToolCalls(payload: unknown) {
+  if (!payload || typeof payload !== 'object') {
+    return [] as Array<{
+      id: string;
+      type: 'function';
+      function: { name: string; arguments: string };
+    }>;
+  }
+
+  const record = payload as {
+    output?: Array<{
+      type?: string;
+      id?: string;
+      call_id?: string;
+      name?: string;
+      arguments?: string;
+    }>;
+  };
+
+  return (record.output ?? [])
+    .filter((item) => item && typeof item === 'object' && item.type === 'function_call')
+    .map((item) => ({
+      id: typeof item.call_id === 'string' ? item.call_id : String(item.id ?? ''),
+      type: 'function' as const,
+      function: {
+        name: typeof item.name === 'string' ? item.name : '',
+        arguments: typeof item.arguments === 'string' ? item.arguments : '',
+      },
+    }));
+}
+
 function adaptResponsesPayloadToChatCompletions(payload: unknown, model: string) {
   const record = (payload && typeof payload === 'object' ? payload : {}) as { id?: string };
   const content = extractResponsesOutputText(payload);
+  const toolCalls = extractResponsesToolCalls(payload);
+  const usage = extractTokenUsageFromPayload(payload);
 
   return {
     id: record.id ?? 'resp-adapted',
@@ -229,10 +500,12 @@ function adaptResponsesPayloadToChatCompletions(payload: unknown, model: string)
         message: {
           role: 'assistant',
           content,
+          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
         },
-        finish_reason: 'stop',
+        finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
       },
     ],
+    ...(usage ? { usage: toChatCompletionUsage(usage) } : {}),
   };
 }
 
@@ -243,10 +516,23 @@ async function* adaptResponsesPayloadToChatCompletionsStream(
   const payload = await payloadPromise;
   const adapted = adaptResponsesPayloadToChatCompletions(payload, model) as {
     id: string;
-    choices: Array<{ message: { content: string } }>;
+    choices: Array<{
+      message: {
+        content?: string;
+        tool_calls?: Array<{
+          id: string;
+          type: 'function';
+          function: { name: string; arguments: string };
+        }>;
+      };
+      finish_reason?: string;
+    }>;
   };
 
   const content = adapted.choices[0]?.message?.content ?? '';
+  const toolCalls = adapted.choices[0]?.message?.tool_calls ?? [];
+  const finishReason = adapted.choices[0]?.finish_reason ?? (toolCalls.length > 0 ? 'tool_calls' : 'stop');
+
   if (content) {
     yield `data: ${JSON.stringify({
       id: adapted.id,
@@ -255,6 +541,32 @@ async function* adaptResponsesPayloadToChatCompletionsStream(
       choices: [{ index: 0, delta: { content } }],
     })}\n\n`;
   }
+
+  if (toolCalls.length > 0) {
+    yield `data: ${JSON.stringify({
+      id: adapted.id,
+      object: 'chat.completion.chunk',
+      model,
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: toolCalls.map((toolCall, index) => ({
+              index,
+              ...toolCall,
+            })),
+          },
+        },
+      ],
+    })}\n\n`;
+  }
+
+  yield `data: ${JSON.stringify({
+    id: adapted.id,
+    object: 'chat.completion.chunk',
+    model,
+    choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+  })}\n\n`;
   yield 'data: [DONE]\n\n';
 }
 
@@ -278,6 +590,16 @@ async function fetchJsonUpstream(args: {
   }
 }
 
+function createLazyPayloadLoader(response: Response): () => Promise<unknown> {
+  let payloadPromise: Promise<unknown> | undefined;
+  return () => {
+    if (!payloadPromise) {
+      payloadPromise = response.json();
+    }
+    return payloadPromise;
+  };
+}
+
 function createOpenAICompletionsFetch(provider: RouterProviderConfig, timeoutMs: number): FetchUpstream {
   if (!provider.baseUrl) {
     throw new Error('Provider baseUrl is required for openai-completions upstreams.');
@@ -286,9 +608,10 @@ function createOpenAICompletionsFetch(provider: RouterProviderConfig, timeoutMs:
   const baseUrl = provider.baseUrl;
 
   return async ({ body, requestId }) => {
+    const requestBody = body as Record<string, unknown>;
     const upstreamBody = {
-      ...(body as Record<string, unknown>),
-      model: stripLrPrefix((body as Record<string, unknown>).model),
+      ...requestBody,
+      model: stripLrPrefix(requestBody.model),
     };
 
     const response = await fetchJsonUpstream({
@@ -298,12 +621,15 @@ function createOpenAICompletionsFetch(provider: RouterProviderConfig, timeoutMs:
       timeoutMs,
     });
     const cloned = response.clone();
+    const loadPayload = createLazyPayloadLoader(cloned);
+    const streaming = streamRequested(requestBody);
 
     return {
       status: response.status,
       headers: responseHeadersToRecord(response.headers),
-      json: async () => cloned.json(),
+      json: async () => loadPayload(),
       textStream: response.body ? readableStreamToTextChunks(response.body) : undefined,
+      usage: streaming ? undefined : async () => extractTokenUsageFromPayload(await loadPayload()),
     };
   };
 }
@@ -318,10 +644,16 @@ function createOpenAIResponsesFetch(provider: RouterProviderConfig, timeoutMs: n
   return async ({ body, requestId }) => {
     const requestBody = body as Record<string, unknown>;
     const model = stripLrPrefix(requestBody.model) ?? '';
+    const normalizedTools = normalizeResponsesTools(requestBody.tools);
     const upstreamBody = {
       model,
       input: buildResponsesInput(requestBody.messages),
       stream: false,
+      ...(normalizedTools ? { tools: normalizedTools } : {}),
+      ...(requestBody.tool_choice !== undefined ? { tool_choice: requestBody.tool_choice } : {}),
+      ...(requestBody.parallel_tool_calls !== undefined ? { parallel_tool_calls: requestBody.parallel_tool_calls } : {}),
+      ...(requestBody.reasoning && typeof requestBody.reasoning === 'object' ? { reasoning: requestBody.reasoning } : {}),
+      ...(typeof requestBody.thinking === 'string' ? { thinking: requestBody.thinking } : {}),
     };
 
     const response = await fetchJsonUpstream({
@@ -331,7 +663,7 @@ function createOpenAIResponsesFetch(provider: RouterProviderConfig, timeoutMs: n
       timeoutMs,
     });
 
-    const payloadPromise = response.json();
+    const loadPayload = createLazyPayloadLoader(response);
     const headers = streamRequested(requestBody)
       ? { 'content-type': 'text/event-stream; charset=utf-8' }
       : { 'content-type': 'application/json; charset=utf-8' };
@@ -339,10 +671,11 @@ function createOpenAIResponsesFetch(provider: RouterProviderConfig, timeoutMs: n
     return {
       status: response.status,
       headers,
-      json: async () => adaptResponsesPayloadToChatCompletions(await payloadPromise, model),
+      json: async () => adaptResponsesPayloadToChatCompletions(await loadPayload(), model),
       textStream: streamRequested(requestBody)
-        ? adaptResponsesPayloadToChatCompletionsStream(payloadPromise, model)
+        ? adaptResponsesPayloadToChatCompletionsStream(loadPayload(), model)
         : undefined,
+      usage: async () => extractTokenUsageFromPayload(await loadPayload()),
     };
   };
 }
@@ -364,6 +697,7 @@ export function createFetchUpstream(baseUrl: string, apiKey?: string, timeoutMs 
 export function createProviderAwareFetch(
   providers: Record<string, RouterProviderConfig>,
   fallback: FallbackUpstreamConfig,
+  thinkingConfig?: RouterThinkingConfig,
 ): FetchUpstream {
   const fallbackFetch = fallback.baseUrl
     ? createFetchUpstream(fallback.baseUrl, fallback.apiKey, fallback.timeoutMs)
@@ -379,8 +713,9 @@ export function createProviderAwareFetch(
     }
 
     const provider = selection.provider;
+    const rewrittenBody = rewriteThinking(args.body as Record<string, unknown>, thinkingConfig);
     const upstreamBody = {
-      ...(args.body as Record<string, unknown>),
+      ...rewrittenBody,
       model: selection.upstreamModel,
     };
 

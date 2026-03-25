@@ -27,7 +27,7 @@ export function buildApp(options: BuildAppOptions = {}) {
           baseUrl: routerConfig.upstream.baseUrl,
           apiKey: routerConfig.upstream.apiKey,
           timeoutMs: routerConfig.upstream.timeoutMs,
-        })
+        }, routerConfig.thinking)
       : routerConfig.upstream.baseUrl
         ? createFetchUpstream(
             routerConfig.upstream.baseUrl,
@@ -69,6 +69,30 @@ export function buildApp(options: BuildAppOptions = {}) {
     modelsAllowCount: routerConfig.models.allow.length,
     traces: routerConfig.traces,
   }));
+
+  app.get('/stats/tokens/daily', async (request) => {
+    const query = (request.query ?? {}) as {
+      date?: string;
+      model?: string;
+      limit?: string | number;
+    };
+    const limit =
+      typeof query.limit === 'number'
+        ? query.limit
+        : typeof query.limit === 'string' && query.limit.trim().length > 0
+          ? Number(query.limit)
+          : undefined;
+
+    const items = traceStore.listDailyTokenUsage({
+      ...(typeof query.date === 'string' && query.date.trim().length > 0 ? { date: query.date.trim() } : {}),
+      ...(typeof query.model === 'string' && query.model.trim().length > 0 ? { model: query.model.trim() } : {}),
+      ...(typeof limit === 'number' && Number.isFinite(limit) && limit > 0 ? { limit } : {}),
+    });
+
+    return {
+      items,
+    };
+  });
 
   app.post(
     '/v1/chat/completions',

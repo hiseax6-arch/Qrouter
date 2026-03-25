@@ -28,6 +28,24 @@ export type RouterProviderConfig = {
   models?: RouterModelEntry[];
 };
 
+export type ThinkingRewriteRule = {
+  match?: string[];
+  when?: {
+    thinking?: string;
+  };
+  rewrite?: {
+    thinking?: string;
+    reasoning?: {
+      effort?: string;
+    };
+  };
+};
+
+export type RouterThinkingConfig = {
+  defaultMode?: 'pass-through';
+  mappings?: ThinkingRewriteRule[];
+};
+
 export type RouterFileConfig = {
   server?: {
     host?: string;
@@ -41,6 +59,7 @@ export type RouterFileConfig = {
   models?: {
     allow?: string[];
   };
+  thinking?: RouterThinkingConfig;
   traces?: {
     dir?: string;
     jsonlPath?: string;
@@ -63,6 +82,7 @@ export type RouterRuntimeConfig = {
   models: {
     allow: string[];
   };
+  thinking: RouterThinkingConfig;
   traces: {
     dir?: string;
     jsonlPath?: string;
@@ -153,6 +173,10 @@ export function loadRouterRuntimeConfig(): RouterRuntimeConfig {
     providers,
     models: {
       allow: fileConfig.models?.allow ?? [],
+    },
+    thinking: {
+      defaultMode: fileConfig.thinking?.defaultMode ?? 'pass-through',
+      mappings: fileConfig.thinking?.mappings ?? [],
     },
     traces: {
       dir: process.env.Q_TRACE_DIR ?? fileConfig.traces?.dir,

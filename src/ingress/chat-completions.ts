@@ -6,13 +6,19 @@ import {
   classifyChatCompletionResult,
 } from '../domain/classify.js';
 import {
+  extractTokenUsageFromPayload,
+  mergeTokenUsage,
+  sumTokenUsage,
+  type TokenUsage,
+} from '../domain/token-usage.js';
+import {
   buildEmptySuccessFailure,
   buildRetryExhaustedFailure,
   buildStreamErrorEvent,
   buildTerminalFailure,
 } from '../errors/terminal-payload.js';
-import type { TraceStore } from '../traces/store.js';
-import type { FetchUpstream } from '../upstream/client.js';
+import { nowTraceTimestamp, type TraceStore } from '../traces/store.js';
+import type { FetchUpstream, UpstreamResponse } from '../upstream/client.js';
 
 export type RetryPolicy = {
   maxAttempts: number;
@@ -92,15 +98,49 @@ function normalizeAllowedModel(model: string | null): string | null {
 
 function buildTraceEvent(requestId: string, event: string, data: Record<string, unknown>) {
   return {
-    timestamp: new Date().toISOString(),
+    timestamp: nowTraceTimestamp(),
     requestId,
     event,
     ...data,
   };
 }
 
+function buildTokenUsageFields(tokenUsage: TokenUsage | null): Record<string, number> {
+  if (!tokenUsage) {
+    return {};
+  }
+
+  return {
+    promptTokens: tokenUsage.promptTokens,
+    completionTokens: tokenUsage.completionTokens,
+    totalTokens: tokenUsage.totalTokens,
+  };
+}
+
+async function resolveAttemptTokenUsage(args: {
+  upstream: UpstreamResponse;
+  payload?: unknown;
+  observedUsage?: TokenUsage | null;
+}): Promise<TokenUsage | null> {
+  let tokenUsage = mergeTokenUsage(
+    args.observedUsage ?? null,
+    args.payload === undefined ? null : extractTokenUsageFromPayload(args.payload),
+  );
+
+  if (!args.upstream.usage) {
+    return tokenUsage;
+  }
+
+  try {
+    return mergeTokenUsage(tokenUsage, await args.upstream.usage());
+  } catch {
+    return tokenUsage;
+  }
+}
+
 async function probeStreamingPreCommit(
   textStream: AsyncIterable<string>,
+  onUsage?: (usage: TokenUsage) => void,
 ): Promise<StreamProbeResult> {
   const iterator = textStream[Symbol.asyncIterator]();
   const bufferedChunks: string[] = [];
@@ -141,6 +181,10 @@ async function probeStreamingPreCommit(
 
       try {
         const parsed = JSON.parse(data);
+        const tokenUsage = extractTokenUsageFromPayload(parsed);
+        if (tokenUsage) {
+          onUsage?.(tokenUsage);
+        }
         const classification = classifyChatCompletionChunk(parsed);
         if (classification.kind === 'semantic_success') {
           return {
@@ -163,10 +207,12 @@ async function forwardCommittedStream(args: {
   bufferedChunks: string[];
   iterator: AsyncIterator<string>;
   onPostCommitError: (errorClass: string) => void;
+  onUsage?: (usage: TokenUsage) => void;
   requestId: string;
   attempts: number;
 }) {
   const downstream = new PassThrough();
+  let lineBuffer = '';
   args.reply.header('content-type', args.contentType);
   args.reply.header('cache-control', 'no-cache');
   args.reply.send(downstream);
@@ -180,6 +226,35 @@ async function forwardCommittedStream(args: {
       const next = await args.iterator.next();
       if (next.done) {
         break;
+      }
+      lineBuffer += next.value;
+      while (true) {
+        const newlineIndex = lineBuffer.indexOf('\n');
+        if (newlineIndex === -1) {
+          break;
+        }
+
+        const rawLine = lineBuffer.slice(0, newlineIndex);
+        lineBuffer = lineBuffer.slice(newlineIndex + 1);
+        const line = rawLine.trim();
+        if (!line.startsWith('data:')) {
+          continue;
+        }
+
+        const data = line.slice(5).trim();
+        if (!data || data === '[DONE]') {
+          continue;
+        }
+
+        try {
+          const parsed = JSON.parse(data);
+          const tokenUsage = extractTokenUsageFromPayload(parsed);
+          if (tokenUsage) {
+            args.onUsage?.(tokenUsage);
+          }
+        } catch {
+          // Ignore malformed chunks and keep bridging the stream.
+        }
       }
       downstream.write(next.value);
     }
@@ -243,6 +318,35 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
     let finalClassification = 'unknown';
     let errorClass: string | null = null;
     let attemptsUsed = 0;
+    let cumulativeTokenUsage: TokenUsage | null = null;
+
+    function recordSummary(attempts: number) {
+      deps.traceStore.recordSummary({
+        requestId,
+        model,
+        stream,
+        attempts,
+        finalClassification,
+        committed,
+        lastStatus,
+        errorClass,
+        tokenUsage: cumulativeTokenUsage,
+        createdAt: nowTraceTimestamp(),
+      });
+    }
+
+    function appendRequestCompleted(attempt: number) {
+      deps.traceStore.appendEvent(
+        buildTraceEvent(requestId, 'request_completed', {
+          attempt,
+          model,
+          stream,
+          classification: finalClassification,
+          committed,
+          ...buildTokenUsageFields(cumulativeTokenUsage),
+        }),
+      );
+    }
 
     for (let attempt = 1; attempt <= deps.retryPolicy.maxAttempts; attempt += 1) {
       attemptsUsed = attempt;
@@ -268,12 +372,15 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
         );
 
         if (upstream.status >= 200 && upstream.status < 300) {
+          let attemptTokenUsage: TokenUsage | null = null;
           if (stream) {
             if (!upstream.textStream) {
               finalClassification = 'malformed_success';
               errorClass = 'malformed_success';
             } else {
-              const probe = await probeStreamingPreCommit(upstream.textStream);
+              const probe = await probeStreamingPreCommit(upstream.textStream, (usage) => {
+                attemptTokenUsage = mergeTokenUsage(attemptTokenUsage, usage);
+              });
 
               if (probe.kind === 'semantic_success') {
                 committed = true;
@@ -296,6 +403,9 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
                   iterator: probe.iterator,
                   requestId,
                   attempts: attempt,
+                  onUsage: (usage) => {
+                    attemptTokenUsage = mergeTokenUsage(attemptTokenUsage, usage);
+                  },
                   onPostCommitError: (postCommitErrorClass) => {
                     finalClassification = 'post_commit_interrupted';
                     errorClass = postCommitErrorClass;
@@ -310,29 +420,21 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
                   },
                 });
 
-                deps.traceStore.recordSummary({
-                  requestId,
-                  model,
-                  stream,
-                  attempts: attempt,
-                  finalClassification,
-                  committed,
-                  lastStatus,
-                  errorClass,
-                  createdAt: new Date().toISOString(),
+                attemptTokenUsage = await resolveAttemptTokenUsage({
+                  upstream,
+                  observedUsage: attemptTokenUsage,
                 });
-                deps.traceStore.appendEvent(
-                  buildTraceEvent(requestId, 'request_completed', {
-                    attempt,
-                    model,
-                    stream,
-                    classification: finalClassification,
-                    committed,
-                  }),
-                );
+                cumulativeTokenUsage = sumTokenUsage(cumulativeTokenUsage, attemptTokenUsage);
+                recordSummary(attempt);
+                appendRequestCompleted(attempt);
                 return reply;
               }
 
+              attemptTokenUsage = await resolveAttemptTokenUsage({
+                upstream,
+                observedUsage: attemptTokenUsage,
+              });
+              cumulativeTokenUsage = sumTokenUsage(cumulativeTokenUsage, attemptTokenUsage);
               finalClassification = 'empty_success';
               errorClass = 'empty_success';
               deps.traceStore.appendEvent(
@@ -346,6 +448,11 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
             }
           } else {
             const payload = await upstream.json();
+            attemptTokenUsage = await resolveAttemptTokenUsage({
+              upstream,
+              payload,
+            });
+            cumulativeTokenUsage = sumTokenUsage(cumulativeTokenUsage, attemptTokenUsage);
             const classification = classifyChatCompletionResult(
               payload as Parameters<typeof classifyChatCompletionResult>[0],
             );
@@ -361,26 +468,8 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
                   committed: false,
                 }),
               );
-              deps.traceStore.recordSummary({
-                requestId,
-                model,
-                stream,
-                attempts: attempt,
-                finalClassification,
-                committed,
-                lastStatus,
-                errorClass,
-                createdAt: new Date().toISOString(),
-              });
-              deps.traceStore.appendEvent(
-                buildTraceEvent(requestId, 'request_completed', {
-                  attempt,
-                  model,
-                  stream,
-                  classification: finalClassification,
-                  committed,
-                }),
-              );
+              recordSummary(attempt);
+              appendRequestCompleted(attempt);
               return reply.code(200).send(payload);
             }
 
@@ -401,26 +490,8 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
             continue;
           }
 
-          deps.traceStore.recordSummary({
-            requestId,
-            model,
-            stream,
-            attempts: attempt,
-            finalClassification,
-            committed,
-            lastStatus,
-            errorClass,
-            createdAt: new Date().toISOString(),
-          });
-          deps.traceStore.appendEvent(
-            buildTraceEvent(requestId, 'request_completed', {
-              attempt,
-              model,
-              stream,
-              classification: finalClassification,
-              committed,
-            }),
-          );
+          recordSummary(attempt);
+          appendRequestCompleted(attempt);
           return reply.code(502).send(
             buildEmptySuccessFailure({
               requestId,
@@ -446,26 +517,8 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
             continue;
           }
 
-          deps.traceStore.recordSummary({
-            requestId,
-            model,
-            stream,
-            attempts: attempt,
-            finalClassification,
-            committed,
-            lastStatus,
-            errorClass,
-            createdAt: new Date().toISOString(),
-          });
-          deps.traceStore.appendEvent(
-            buildTraceEvent(requestId, 'request_completed', {
-              attempt,
-              model,
-              stream,
-              classification: finalClassification,
-              committed,
-            }),
-          );
+          recordSummary(attempt);
+          appendRequestCompleted(attempt);
           return reply.code(502).send(
             buildRetryExhaustedFailure({
               requestId,
@@ -477,26 +530,8 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
 
         finalClassification = `http_${upstream.status}`;
         errorClass = finalClassification;
-        deps.traceStore.recordSummary({
-          requestId,
-          model,
-          stream,
-          attempts: attempt,
-          finalClassification,
-          committed,
-          lastStatus,
-          errorClass,
-          createdAt: new Date().toISOString(),
-        });
-        deps.traceStore.appendEvent(
-          buildTraceEvent(requestId, 'request_completed', {
-            attempt,
-            model,
-            stream,
-            classification: finalClassification,
-            committed,
-          }),
-        );
+        recordSummary(attempt);
+        appendRequestCompleted(attempt);
         return reply.code(upstream.status).send(
           buildTerminalFailure({
             requestId,
@@ -521,26 +556,8 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
           continue;
         }
 
-        deps.traceStore.recordSummary({
-          requestId,
-          model,
-          stream,
-          attempts: attempt,
-          finalClassification,
-          committed,
-          lastStatus,
-          errorClass,
-          createdAt: new Date().toISOString(),
-        });
-        deps.traceStore.appendEvent(
-          buildTraceEvent(requestId, 'request_completed', {
-            attempt,
-            model,
-            stream,
-            classification: finalClassification,
-            committed,
-          }),
-        );
+        recordSummary(attempt);
+        appendRequestCompleted(attempt);
         return reply.code(502).send(
           buildRetryExhaustedFailure({
             requestId,
@@ -551,26 +568,8 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
       }
     }
 
-    deps.traceStore.recordSummary({
-      requestId,
-      model,
-      stream,
-      attempts: attemptsUsed,
-      finalClassification,
-      committed,
-      lastStatus,
-      errorClass,
-      createdAt: new Date().toISOString(),
-    });
-    deps.traceStore.appendEvent(
-      buildTraceEvent(requestId, 'request_completed', {
-        attempt: attemptsUsed,
-        model,
-        stream,
-        classification: finalClassification,
-        committed,
-      }),
-    );
+    recordSummary(attemptsUsed);
+    appendRequestCompleted(attemptsUsed);
     return reply.code(500).send({
       error: {
         message: 'Router exhausted control flow unexpectedly.',

@@ -100,6 +100,12 @@ Suggested configurable values:
 - whether to retry on malformed 2xx payloads
 - whether to respect upstream `Retry-After`
 
+## Provider Auth Behavior
+- `auth: "api-key"` + `authHeader: true` => send `Authorization: Bearer <apiKey>`
+- `auth: "api-key"` + `authHeader: false` => send `x-api-key: <apiKey>`
+- `auth: "token"` / `auth: "oauth"` => send `Authorization: Bearer <apiKey>`
+- explicit entries in `headers` are preserved and are not overwritten by generated auth headers
+
 ## OpenClaw Integration Config
 ### Strategy
 Use a dedicated provider entry pointing at qingfu-router.

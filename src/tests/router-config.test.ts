@@ -80,6 +80,16 @@ describe('router config file', () => {
       models: {
         allow: ['stepfun/step-3.5-flash:free', 'gpt-5.4'],
       },
+      thinking: {
+        defaultMode: 'pass-through',
+        mappings: [
+          {
+            match: ['LR/gpt-5.4', 'gpt-5.4'],
+            when: { thinking: 'low' },
+            rewrite: { thinking: 'xhigh' },
+          },
+        ],
+      },
     });
 
     chdir(dir);
@@ -97,6 +107,16 @@ describe('router config file', () => {
       'stepfun/step-3.5-flash:free',
       'gpt-5.4',
     ]);
+    expect(runtime.thinking).toEqual({
+      defaultMode: 'pass-through',
+      mappings: [
+        {
+          match: ['LR/gpt-5.4', 'gpt-5.4'],
+          when: { thinking: 'low' },
+          rewrite: { thinking: 'xhigh' },
+        },
+      ],
+    });
     expect(runtime.providers.openrouter).toMatchObject({
       api: 'openai-completions',
       baseUrl: 'https://openrouter.ai/api/v1',

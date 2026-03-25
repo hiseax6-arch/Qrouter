@@ -1,10 +1,10 @@
 import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import Database from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, test } from 'vitest';
 import { buildApp } from '../server.js';
-import { createTraceStore } from '../traces/store.js';
+import { createNoopTraceStore, createTraceStore, nowTraceTimestamp } from '../traces/store.js';
 
 function streamFromChunks(chunks: string[]): AsyncIterable<string> {
   return {
@@ -29,6 +29,7 @@ describe('POST /v1/chat/completions', () => {
   test('retries empty-success once and returns the later semantic success', async () => {
     let attempts = 0;
     const app = buildApp({
+      traceStore: createNoopTraceStore(),
       fetchUpstream: async () => {
         attempts += 1;
 
@@ -166,7 +167,7 @@ describe('POST /v1/chat/completions', () => {
       ]),
     );
 
-    const db = new Database(sqlitePath, { readonly: true });
+    const db = new DatabaseSync(sqlitePath);
     const rows = db
       .prepare('SELECT attempts, final_classification, committed, error_class FROM request_summaries')
       .all() as Array<{
@@ -189,6 +190,7 @@ describe('POST /v1/chat/completions', () => {
   test('surfaces explicit failure when all attempts end as empty-success', async () => {
     let attempts = 0;
     const app = buildApp({
+      traceStore: createNoopTraceStore(),
       retryPolicy: {
         maxAttempts: 2,
         backoffMs: () => 0,
@@ -237,9 +239,103 @@ describe('POST /v1/chat/completions', () => {
     await app.close();
   });
 
+  test('accumulates token usage across retries into the daily per-model stats', async () => {
+    let attempts = 0;
+    const tempDir = mkdtempSync(join(tmpdir(), 'Q-router-token-retry-'));
+    const jsonlPath = join(tempDir, 'events.jsonl');
+    const sqlitePath = join(tempDir, 'summaries.sqlite');
+    const traceStore = createTraceStore({ jsonlPath, sqlitePath });
+
+    const app = buildApp({
+      traceStore,
+      fetchUpstream: async () => {
+        attempts += 1;
+
+        if (attempts === 1) {
+          return {
+            status: 200,
+            headers: {},
+            json: async () => ({
+              id: 'resp-empty-usage',
+              usage: {
+                prompt_tokens: 50,
+                completion_tokens: 10,
+                total_tokens: 60,
+              },
+              choices: [
+                {
+                  message: {
+                    role: 'assistant',
+                    content: '',
+                  },
+                },
+              ],
+            }),
+          };
+        }
+
+        return {
+          status: 200,
+          headers: {},
+          json: async () => ({
+            id: 'resp-ok-usage',
+            usage: {
+              prompt_tokens: 60,
+              completion_tokens: 20,
+              total_tokens: 80,
+            },
+            choices: [
+              {
+                message: {
+                  role: 'assistant',
+                  content: 'recovered with usage',
+                },
+              },
+            ],
+          }),
+        };
+      },
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-5.4',
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(attempts).toBe(2);
+
+    const statsResponse = await app.inject({
+      method: 'GET',
+      url: '/stats/tokens/daily?model=gpt-5.4',
+    });
+
+    expect(statsResponse.statusCode).toBe(200);
+    expect(statsResponse.json()).toEqual({
+      items: [
+        {
+          date: nowTraceTimestamp().slice(0, 10),
+          model: 'gpt-5.4',
+          requestCount: 1,
+          promptTokens: 110,
+          completionTokens: 30,
+          totalTokens: 140,
+          updatedAt: expect.stringMatching(/\+08:00$/),
+        },
+      ],
+    });
+
+    await app.close();
+  });
+
   test('buffers streaming responses until semantic content appears and retries empty pre-commit streams', async () => {
     let attempts = 0;
     const app = buildApp({
+      traceStore: createNoopTraceStore(),
       fetchUpstream: async () => {
         attempts += 1;
 
@@ -348,7 +444,7 @@ describe('POST /v1/chat/completions', () => {
       ]),
     );
 
-    const db = new Database(sqlitePath, { readonly: true });
+    const db = new DatabaseSync(sqlitePath);
     const rows = db
       .prepare('SELECT attempts, final_classification, committed, error_class FROM request_summaries')
       .all() as Array<{
@@ -426,7 +522,7 @@ describe('POST /v1/chat/completions', () => {
       ]),
     );
 
-    const db = new Database(sqlitePath, { readonly: true });
+    const db = new DatabaseSync(sqlitePath);
     const rows = db
       .prepare('SELECT attempts, final_classification, committed, error_class FROM request_summaries')
       .all() as Array<{
@@ -496,11 +592,21 @@ describe('POST /v1/chat/completions', () => {
         'request_completed',
       ]),
     );
+    expect(jsonl.every((event) => typeof event.timestamp === 'string' && event.timestamp.endsWith('+08:00'))).toBe(true);
+    expect(jsonl.every((event) => typeof event.timestamp === 'string' && !event.timestamp.endsWith('Z'))).toBe(true);
 
-    const db = new Database(sqlitePath, { readonly: true });
+    const db = new DatabaseSync(sqlitePath);
     const rows = db
-      .prepare('SELECT attempts, final_classification, committed FROM request_summaries')
-      .all() as Array<{ attempts: number; final_classification: string; committed: number }>;
+      .prepare('SELECT attempts, final_classification, committed, created_at, prompt_tokens, completion_tokens, total_tokens FROM request_summaries')
+      .all() as Array<{
+      attempts: number;
+      final_classification: string;
+      committed: number;
+      created_at: string;
+      prompt_tokens: number;
+      completion_tokens: number;
+      total_tokens: number;
+    }>;
     db.close();
 
     expect(rows).toHaveLength(1);
@@ -508,6 +614,116 @@ describe('POST /v1/chat/completions', () => {
       attempts: 1,
       final_classification: 'semantic_success',
       committed: 0,
+      created_at: expect.stringMatching(/\+08:00$/),
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
     });
+  });
+
+  test('aggregates daily token usage by model and keeps models separated', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'Q-router-token-stats-'));
+    const jsonlPath = join(tempDir, 'events.jsonl');
+    const sqlitePath = join(tempDir, 'summaries.sqlite');
+    const traceStore = createTraceStore({ jsonlPath, sqlitePath });
+
+    const app = buildApp({
+      traceStore,
+      fetchUpstream: async ({ body }) => {
+        const model = String((body as { model?: string }).model ?? '');
+        if (model === 'gpt-5.4') {
+          return {
+            status: 200,
+            headers: {},
+            json: async () => ({
+              id: 'resp-gpt',
+              usage: {
+                prompt_tokens: 120,
+                completion_tokens: 45,
+                total_tokens: 165,
+              },
+              choices: [
+                {
+                  message: {
+                    role: 'assistant',
+                    content: 'hello gpt',
+                  },
+                },
+              ],
+            }),
+          };
+        }
+
+        return {
+          status: 200,
+          headers: {},
+          json: async () => ({
+            id: 'resp-step',
+            usage: {
+              prompt_tokens: 60,
+              completion_tokens: 15,
+              total_tokens: 75,
+            },
+            choices: [
+              {
+                message: {
+                  role: 'assistant',
+                  content: 'hello step',
+                },
+              },
+            ],
+          }),
+        };
+      },
+    });
+
+    await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-5.4',
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'stepfun/step-3.5-flash:free',
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/stats/tokens/daily',
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      items: expect.arrayContaining([
+        {
+          date: nowTraceTimestamp().slice(0, 10),
+          model: 'gpt-5.4',
+          requestCount: 1,
+          promptTokens: 120,
+          completionTokens: 45,
+          totalTokens: 165,
+          updatedAt: expect.stringMatching(/\+08:00$/),
+        },
+        {
+          date: nowTraceTimestamp().slice(0, 10),
+          model: 'stepfun/step-3.5-flash:free',
+          requestCount: 1,
+          promptTokens: 60,
+          completionTokens: 15,
+          totalTokens: 75,
+          updatedAt: expect.stringMatching(/\+08:00$/),
+        },
+      ]),
+    });
+
+    await app.close();
   });
 });

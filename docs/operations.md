@@ -92,6 +92,19 @@ Expected use:
 - counts by model or failure class,
 - daily incident review.
 
+### Daily token stats
+Use:
+- `GET /stats/tokens/daily`
+- optional query params: `date=YYYY-MM-DD`, `model=<model-id>`, `limit=<n>`
+
+Returned dimensions:
+- date
+- model
+- requestCount
+- promptTokens
+- completionTokens
+- totalTokens
+
 ## Failure Classes to Expect
 - `empty_success`
 - `timeout`

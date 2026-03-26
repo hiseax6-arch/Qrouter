@@ -586,7 +586,7 @@ describe('provider-aware upstream routing', () => {
     await app.close();
   });
 
-  test('rewrites low thinking to reasoning.effort xhigh for gpt-5.4 via configured mapping', async () => {
+  test('rewrites low thinking to reasoning.effort low for gpt-5.4 without forcing xhigh', async () => {
     const dir = writeRouterConfig({
       providers: {
         codex: {
@@ -611,6 +611,7 @@ describe('provider-aware upstream routing', () => {
       },
       thinking: {
         defaultMode: 'pass-through',
+        mappingsEnabled: false,
         mappings: [
           {
             match: ['LR/gpt-5.4', 'gpt-5.4'],
@@ -671,7 +672,7 @@ describe('provider-aware upstream routing', () => {
     expect(body).toMatchObject({
       model: 'gpt-5.4',
       reasoning: {
-        effort: 'xhigh',
+        effort: 'low',
       },
     });
     expect(body.thinking).toBeUndefined();

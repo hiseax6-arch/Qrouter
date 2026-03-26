@@ -82,6 +82,7 @@ describe('router config file', () => {
       },
       thinking: {
         defaultMode: 'pass-through',
+        mappingsEnabled: true,
         mappings: [
           {
             match: ['LR/gpt-5.4', 'gpt-5.4'],
@@ -109,6 +110,7 @@ describe('router config file', () => {
     ]);
     expect(runtime.thinking).toEqual({
       defaultMode: 'pass-through',
+      mappingsEnabled: true,
       mappings: [
         {
           match: ['LR/gpt-5.4', 'gpt-5.4'],

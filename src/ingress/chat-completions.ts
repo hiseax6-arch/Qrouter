@@ -380,6 +380,11 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
       buildTraceEvent(requestId, 'request_received', {
         model,
         stream,
+        ...(typeof (body as Record<string, unknown>).thinking === 'string' ? { thinking: (body as Record<string, unknown>).thinking } : {}),
+        ...(typeof (body as Record<string, unknown>).reasoning_effort === 'string' ? { reasoning_effort: (body as Record<string, unknown>).reasoning_effort } : {}),
+        ...(((body as Record<string, unknown>).reasoning && typeof (body as Record<string, unknown>).reasoning === 'object' && typeof ((body as Record<string, unknown>).reasoning as { effort?: unknown }).effort === 'string')
+          ? { reasoning_effort_object: ((body as Record<string, unknown>).reasoning as { effort: string }).effort }
+          : {}),
       }),
     );
 
@@ -470,6 +475,19 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
             ...(upstream.upstreamUrl ? { upstreamUrl: upstream.upstreamUrl } : {}),
           }),
         );
+
+        if (upstream.thinkingTrace) {
+          deps.traceStore.appendEvent(
+            buildTraceEvent(requestId, 'payload_rewritten', {
+              attempt,
+              model,
+              stream,
+              ...(upstream.providerId ? { providerId: upstream.providerId } : {}),
+              ...(upstream.upstreamUrl ? { upstreamUrl: upstream.upstreamUrl } : {}),
+              ...upstream.thinkingTrace,
+            }),
+          );
+        }
 
         if (lastUpstreamError) {
           deps.traceStore.appendEvent(

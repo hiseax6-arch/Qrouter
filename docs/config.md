@@ -36,7 +36,8 @@ Suggested contents:
 - backoff policy,
 - timeout budgets,
 - trace toggles,
-- model routing defaults.
+- model routing defaults,
+- thinking compatibility policy.
 
 ## Proposed Router Config Shape (Draft)
 ```json5
@@ -99,6 +100,34 @@ Suggested configurable values:
 - per-class backoff windows
 - whether to retry on malformed 2xx payloads
 - whether to respect upstream `Retry-After`
+
+## Thinking Compatibility Switch
+`thinking` config now has two layers:
+- `mappingsEnabled`: whether custom thinking rewrite rules are active.
+- `mappings`: optional explicit rewrite rules.
+
+Recommended behavior:
+- keep `mappingsEnabled: false` if you only want compatibility translation from `thinking` -> `reasoning.effort` for Responses/Codex upstreams;
+- set `mappingsEnabled: true` only when you intentionally want custom remaps such as `low -> xhigh`.
+
+Example:
+```json
+{
+  "thinking": {
+    "defaultMode": "pass-through",
+    "mappingsEnabled": false,
+    "mappings": [
+      {
+        "match": ["LR/gpt-5.4", "gpt-5.4"],
+        "when": { "thinking": "low" },
+        "rewrite": { "reasoning": { "effort": "xhigh" } }
+      }
+    ]
+  }
+}
+```
+
+With the example above, the rule is stored but inactive until `mappingsEnabled` is turned on.
 
 ## Provider Auth Behavior
 - `auth: "api-key"` + `authHeader: true` => send `Authorization: Bearer <apiKey>`

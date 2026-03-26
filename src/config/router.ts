@@ -43,6 +43,7 @@ export type ThinkingRewriteRule = {
 
 export type RouterThinkingConfig = {
   defaultMode?: 'pass-through';
+  mappingsEnabled?: boolean;
   mappings?: ThinkingRewriteRule[];
 };
 
@@ -176,6 +177,7 @@ export function loadRouterRuntimeConfig(): RouterRuntimeConfig {
     },
     thinking: {
       defaultMode: fileConfig.thinking?.defaultMode ?? 'pass-through',
+      mappingsEnabled: fileConfig.thinking?.mappingsEnabled ?? true,
       mappings: fileConfig.thinking?.mappings ?? [],
     },
     traces: {

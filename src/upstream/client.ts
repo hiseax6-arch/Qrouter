@@ -5,6 +5,42 @@ import {
   type TokenUsage,
 } from '../domain/token-usage.js';
 
+type ThinkingTrace = {
+  inboundThinking?: string;
+  inboundReasoningEffort?: string;
+  inboundReasoningEffortObject?: string;
+  outboundThinking?: string;
+  outboundReasoningEffort?: string;
+  outboundReasoningEffortObject?: string;
+};
+
+function getReasoningEffort(body: Record<string, unknown>): string | undefined {
+  if (body.reasoning && typeof body.reasoning === 'object') {
+    const effort = (body.reasoning as { effort?: unknown }).effort;
+    if (typeof effort === 'string') {
+      return effort;
+    }
+  }
+  return undefined;
+}
+
+function buildThinkingTrace(
+  inbound: Record<string, unknown>,
+  outbound: Record<string, unknown>,
+): ThinkingTrace {
+  const inboundReasoningEffortObject = getReasoningEffort(inbound);
+  const outboundReasoningEffortObject = getReasoningEffort(outbound);
+
+  return {
+    ...(typeof inbound.thinking === 'string' ? { inboundThinking: inbound.thinking } : {}),
+    ...(typeof inbound.reasoning_effort === 'string' ? { inboundReasoningEffort: inbound.reasoning_effort } : {}),
+    ...(inboundReasoningEffortObject ? { inboundReasoningEffortObject } : {}),
+    ...(typeof outbound.thinking === 'string' ? { outboundThinking: outbound.thinking } : {}),
+    ...(typeof outbound.reasoning_effort === 'string' ? { outboundReasoningEffort: outbound.reasoning_effort } : {}),
+    ...(outboundReasoningEffortObject ? { outboundReasoningEffortObject } : {}),
+  };
+}
+
 const textDecoder = new TextDecoder();
 
 export type UpstreamResponse = {
@@ -16,6 +52,7 @@ export type UpstreamResponse = {
   bodyText?(): Promise<string>;
   providerId?: string;
   upstreamUrl?: string;
+  thinkingTrace?: ThinkingTrace;
 };
 
 export type FetchUpstreamArgs = {
@@ -71,21 +108,19 @@ function hasNonEmptyTextPart(content: unknown): boolean {
 function rewriteThinking(
   body: Record<string, unknown>,
   thinkingConfig: RouterThinkingConfig | undefined,
-): Record<string, unknown> {
+): { body: Record<string, unknown>; trace: ThinkingTrace } {
   const requestModel = typeof body.model === 'string' ? body.model : undefined;
-  const requestThinking = typeof body.thinking === 'string'
-    ? body.thinking
-    : typeof body.reasoning_effort === 'string'
-      ? body.reasoning_effort
-      : undefined;
+  const inboundThinking = typeof body.thinking === 'string' ? body.thinking : undefined;
+  const inboundReasoningEffort = typeof body.reasoning_effort === 'string' ? body.reasoning_effort : undefined;
+  const requestThinking = inboundThinking ?? inboundReasoningEffort;
 
   if (!requestModel || !requestThinking) {
-    return body;
+    return { body, trace: buildThinkingTrace(body, body) };
   }
 
   const normalizedModel = stripLrPrefix(requestModel) ?? requestModel;
 
-  if (thinkingConfig && thinkingConfig.defaultMode === 'pass-through') {
+  if (thinkingConfig && thinkingConfig.defaultMode === 'pass-through' && thinkingConfig.mappingsEnabled !== false) {
     for (const rule of thinkingConfig.mappings ?? []) {
       const matches = rule.match ?? [];
       const hit = matches.includes(requestModel) || matches.includes(normalizedModel);
@@ -101,39 +136,56 @@ function rewriteThinking(
       delete nextBody.reasoning_effort;
 
       if (rule.rewrite?.reasoning && typeof rule.rewrite.reasoning === 'object') {
-        return {
+        const rewritten = {
           ...nextBody,
           reasoning: rule.rewrite.reasoning,
         };
+        return { body: rewritten, trace: buildThinkingTrace(body, rewritten) };
       }
 
       if (rule.rewrite?.thinking && rule.rewrite.thinking !== requestThinking) {
-        return {
+        const rewritten = {
           ...nextBody,
           reasoning: { effort: rule.rewrite.thinking },
         };
+        return { body: rewritten, trace: buildThinkingTrace(body, rewritten) };
       }
 
-      return {
+      const rewritten = {
         ...nextBody,
         reasoning: { effort: requestThinking },
       };
+      return { body: rewritten, trace: buildThinkingTrace(body, rewritten) };
     }
   }
 
-  if (typeof body.reasoning_effort === 'string') {
+  if (inboundThinking) {
+    const rewritten: Record<string, unknown> = {
+      ...body,
+      reasoning: {
+        ...(body.reasoning && typeof body.reasoning === 'object' ? body.reasoning as Record<string, unknown> : {}),
+        effort: requestThinking,
+      },
+    };
+    delete rewritten.thinking;
+    delete rewritten.reasoning_effort;
+    return { body: rewritten, trace: buildThinkingTrace(body, rewritten) };
+  }
+
+  if (inboundReasoningEffort) {
     const nextBody = { ...body };
     delete nextBody.reasoning_effort;
     if (!nextBody.reasoning || typeof nextBody.reasoning !== 'object') {
-      return {
+      const rewritten = {
         ...nextBody,
         reasoning: { effort: requestThinking },
       };
+      return { body: rewritten, trace: buildThinkingTrace(body, rewritten) };
     }
-    return nextBody;
+    return { body: nextBody, trace: buildThinkingTrace(body, nextBody) };
   }
 
-  return body;
+  return { body, trace: buildThinkingTrace(body, body) };
 }
 
 async function* readableStreamToTextChunks(
@@ -733,11 +785,12 @@ export function createProviderAwareFetch(
     }
 
     const provider = selection.provider;
-    const rewrittenBody = rewriteThinking(args.body as Record<string, unknown>, thinkingConfig);
+    const rewriteResult = rewriteThinking(args.body as Record<string, unknown>, thinkingConfig);
     const upstreamBody = {
-      ...rewrittenBody,
+      ...rewriteResult.body,
       model: selection.upstreamModel,
     };
+    const finalThinkingTrace = buildThinkingTrace(args.body as Record<string, unknown>, upstreamBody);
 
     if (provider.api === 'openai-responses') {
       const upstream = await createOpenAIResponsesFetch(provider, fallback.timeoutMs)({
@@ -747,6 +800,7 @@ export function createProviderAwareFetch(
       return {
         ...upstream,
         providerId: selection.providerId,
+        thinkingTrace: finalThinkingTrace,
       };
     }
 
@@ -757,6 +811,7 @@ export function createProviderAwareFetch(
     return {
       ...upstream,
       providerId: selection.providerId,
+      thinkingTrace: finalThinkingTrace,
     };
   };
 }

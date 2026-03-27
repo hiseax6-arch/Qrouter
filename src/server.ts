@@ -1,8 +1,9 @@
 import Fastify from 'fastify';
 import { loadRouterRuntimeConfig, type RouterRuntimeConfig } from './config/router.js';
 import { createChatCompletionsHandler, type RetryPolicy } from './ingress/chat-completions.js';
+import { createResponsesHandler } from './ingress/responses.js';
 import { createNoopTraceStore, createTraceStore, resolveTracePaths, type TraceStore } from './traces/store.js';
-import { createFetchUpstream, createProviderAwareFetch, type FetchUpstream } from './upstream/client.js';
+import { createFetchUpstream, createProviderAwareFetch, createProviderAwareResponsesPassthrough, type FetchUpstream } from './upstream/client.js';
 
 export type BuildAppOptions = {
   fetchUpstream?: FetchUpstream;
@@ -37,6 +38,15 @@ export function buildApp(options: BuildAppOptions = {}) {
         : (async () => {
             throw new Error('Q_UPSTREAM_BASE_URL is required when no fetchUpstream override is provided.');
           }));
+
+  const fetchResponsesUpstream =
+    Object.keys(routerConfig.providers).length > 0
+      ? createProviderAwareResponsesPassthrough(routerConfig.providers, {
+          baseUrl: routerConfig.upstream.baseUrl,
+          apiKey: routerConfig.upstream.apiKey,
+          timeoutMs: routerConfig.upstream.timeoutMs,
+        }, routerConfig.thinking)
+      : fetchUpstream;
 
   const traceStore =
     options.traceStore ??
@@ -99,6 +109,15 @@ export function buildApp(options: BuildAppOptions = {}) {
     createChatCompletionsHandler({
       fetchUpstream,
       retryPolicy: options.retryPolicy ?? defaultRetryPolicy,
+      traceStore,
+      allowedModels,
+    }),
+  );
+
+  app.post(
+    '/v1/responses',
+    createResponsesHandler({
+      fetchUpstream: fetchResponsesUpstream,
       traceStore,
       allowedModels,
     }),

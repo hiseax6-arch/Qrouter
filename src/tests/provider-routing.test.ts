@@ -307,7 +307,7 @@ describe('provider-aware upstream routing', () => {
 
     const [, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
     const body = JSON.parse(String(init.body));
-    expect(body.stream).toBe(false);
+    expect(body.stream).toBe(true);
 
     await app.close();
   });
@@ -1252,6 +1252,234 @@ describe('provider-aware upstream routing', () => {
         content: [{ type: 'input_text', text: 'hi' }],
       },
     ]);
+
+    await app.close();
+  });
+
+  test('proxies /v1/responses requests to codex upstream with model normalization', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        codex: {
+          api: 'openai-responses',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://codex.example.test/v1',
+          models: [
+            {
+              id: 'gpt-5.4',
+              name: 'GPT-5.4',
+            },
+          ],
+        },
+      },
+      models: {
+        allow: ['LR/gpt-5.4', 'gpt-5.4'],
+      },
+    });
+
+    chdir(dir);
+    process.env.Q_CODEX_API_KEY = 'codex-secret';
+
+    const fetchSpy = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'resp-passthrough',
+          object: 'response',
+          output: [],
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'LR/gpt-5.4',
+        input: 'hi',
+        stream: false,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      id: 'resp-passthrough',
+      object: 'response',
+    });
+
+    const [url, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('https://codex.example.test/v1/responses');
+    const body = JSON.parse(String(init.body));
+    expect(body).toMatchObject({
+      model: 'gpt-5.4',
+      input: 'hi',
+      stream: false,
+    });
+
+    await app.close();
+  });
+
+
+  test('adapts raw responses SSE into chat-completions chunks for streaming requests', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        codex: {
+          api: 'openai-responses',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://codex.example.test/v1',
+          models: [
+            {
+              id: 'gpt-5.4',
+              name: 'GPT-5.4',
+            },
+          ],
+        },
+      },
+      models: {
+        allow: ['gpt-5.4'],
+      },
+    });
+
+    chdir(dir);
+    process.env.Q_CODEX_API_KEY = 'codex-secret';
+
+    const encoder = new TextEncoder();
+    const fetchSpy = vi.fn(async () => {
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode(`event: response.created\n`));
+            controller.enqueue(encoder.encode(`:\n`));
+            controller.enqueue(encoder.encode(`data: {"type":"response.created","response":{"id":"resp-chat-stream"}}\n\n`));
+            controller.enqueue(encoder.encode(`event: response.output_text.delta\n`));
+            controller.enqueue(encoder.encode(`data: {"type":"response.output_text.delta","delta":"hello ","item_id":"msg_1"}\n\n`));
+            controller.enqueue(encoder.encode(`data: {"type":"response.output_text.delta","delta":"world","item_id":"msg_1"}\n\n`));
+            controller.enqueue(encoder.encode(`event: response.completed\n`));
+            controller.enqueue(encoder.encode(`data: {"type":"response.completed","response":{"id":"resp-chat-stream"}}\n\n`));
+            controller.close();
+          },
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'text/event-stream',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-5.4',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['content-type']).toContain('text/event-stream');
+    expect(response.body).toContain('chat.completion.chunk');
+    expect(response.body).toContain('resp-chat-stream');
+    expect(response.body).toContain('hello ');
+    expect(response.body).toContain('world');
+    expect(response.body).toContain('[DONE]');
+    expect(response.body).not.toContain('event: response.created');
+
+    const [, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.stream).toBe(true);
+
+    await app.close();
+  });
+
+  test('sanitizes responses SSE so downstream only sees data frames', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        codex: {
+          api: 'openai-responses',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://codex.example.test/v1',
+          models: [
+            {
+              id: 'gpt-5.4',
+              name: 'GPT-5.4',
+            },
+          ],
+        },
+      },
+      models: {
+        allow: ['LR/gpt-5.4', 'gpt-5.4'],
+      },
+    });
+
+    chdir(dir);
+    process.env.Q_CODEX_API_KEY = 'codex-secret';
+
+    const encoder = new TextEncoder();
+    const fetchSpy = vi.fn(async () => {
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode('event: response.created\n'));
+            controller.enqueue(encoder.encode(':\n'));
+            controller.enqueue(encoder.encode('data: {"type":"response.created","response":{"id":"resp_passthrough"}}\n\n'));
+            controller.enqueue(encoder.encode('event: response.output_text.delta\n'));
+            controller.enqueue(encoder.encode('data: {"type":"response.output_text.delta","delta":"hi"}\n\n'));
+            controller.enqueue(encoder.encode('event: response.completed\n'));
+            controller.enqueue(encoder.encode('data: {"type":"response.completed","response":{"id":"resp_passthrough"}}\n\n'));
+            controller.close();
+          },
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'text/event-stream',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'LR/gpt-5.4',
+        input: 'hi',
+        stream: true,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['content-type']).toContain('text/event-stream');
+    expect(response.body).toContain('data: {"type":"response.created"');
+    expect(response.body).toContain('data: {"type":"response.output_text.delta"');
+    expect(response.body).toContain('data: {"type":"response.completed"');
+    expect(response.body).not.toContain('event: response.created');
+    expect(response.body).not.toContain('\n:\n');
 
     await app.close();
   });

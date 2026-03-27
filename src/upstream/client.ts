@@ -214,6 +214,46 @@ async function* readableStreamToTextChunks(
   }
 }
 
+async function* sanitizeResponsesSseStream(
+  textStream: AsyncIterable<string>,
+): AsyncIterable<string> {
+  let lineBuffer = '';
+
+  for await (const chunk of textStream) {
+    lineBuffer += chunk;
+
+    while (true) {
+      const newlineIndex = lineBuffer.indexOf('\n');
+      if (newlineIndex === -1) {
+        break;
+      }
+
+      const rawLine = lineBuffer.slice(0, newlineIndex).replace(/\r$/, '');
+      lineBuffer = lineBuffer.slice(newlineIndex + 1);
+      const trimmed = rawLine.trim();
+
+      if (!trimmed || trimmed.startsWith(':') || !trimmed.startsWith('data:')) {
+        continue;
+      }
+
+      const data = trimmed.slice(5).trim();
+      if (!data) {
+        continue;
+      }
+
+      yield `data: ${data}\n\n`;
+    }
+  }
+
+  const trailing = lineBuffer.replace(/\r$/, '').trim();
+  if (trailing.startsWith('data:')) {
+    const data = trailing.slice(5).trim();
+    if (data) {
+      yield `data: ${data}\n\n`;
+    }
+  }
+}
+
 function responseHeadersToRecord(headers: Headers): Record<string, string> {
   return Object.fromEntries(headers.entries());
 }
@@ -625,6 +665,186 @@ async function* adaptResponsesPayloadToChatCompletionsStream(
   yield 'data: [DONE]\n\n';
 }
 
+type ResponsesFunctionCallState = {
+  id: string;
+  name: string;
+  arguments: string;
+  outputIndex: number;
+};
+
+async function* adaptResponsesSseToChatCompletionsStream(
+  textStream: AsyncIterable<string>,
+  model: string,
+): AsyncIterable<string> {
+  let lineBuffer = '';
+  let responseId = 'resp-adapted';
+  let emittedToolCall = false;
+  const functionCalls = new Map<string, ResponsesFunctionCallState>();
+
+  const ensureFunctionCall = (key: string, seed?: Partial<ResponsesFunctionCallState>) => {
+    const current = functionCalls.get(key) ?? {
+      id: key,
+      name: '',
+      arguments: '',
+      outputIndex: 0,
+    };
+    const next = {
+      ...current,
+      ...(seed ?? {}),
+    };
+    functionCalls.set(key, next);
+    return next;
+  };
+
+  for await (const chunk of textStream) {
+    lineBuffer += chunk;
+
+    while (true) {
+      const newlineIndex = lineBuffer.indexOf('\n');
+      if (newlineIndex === -1) {
+        break;
+      }
+
+      const rawLine = lineBuffer.slice(0, newlineIndex).replace(/\r$/, '');
+      lineBuffer = lineBuffer.slice(newlineIndex + 1);
+      const trimmed = rawLine.trim();
+
+      if (!trimmed || trimmed.startsWith(':') || !trimmed.startsWith('data:')) {
+        continue;
+      }
+
+      const data = trimmed.slice(5).trim();
+      if (!data || data === '[DONE]') {
+        continue;
+      }
+
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(data) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+
+      const eventType = typeof parsed.type === 'string' ? parsed.type : '';
+      if (eventType === 'response.created') {
+        const candidateId = (parsed.response && typeof parsed.response === 'object')
+          ? (parsed.response as { id?: unknown }).id
+          : undefined;
+        if (typeof candidateId === 'string' && candidateId) {
+          responseId = candidateId;
+        }
+        continue;
+      }
+
+      if (eventType === 'response.output_text.delta') {
+        const delta = typeof parsed.delta === 'string' ? parsed.delta : '';
+        if (!delta) {
+          continue;
+        }
+        yield `data: ${JSON.stringify({
+          id: responseId,
+          object: 'chat.completion.chunk',
+          model,
+          choices: [{ index: 0, delta: { content: delta } }],
+        })}\n\n`;
+        continue;
+      }
+
+      if (eventType === 'response.output_item.added' || eventType === 'response.output_item.done') {
+        const item = parsed.item && typeof parsed.item === 'object'
+          ? parsed.item as Record<string, unknown>
+          : null;
+        if (item?.type === 'function_call') {
+          const key = typeof item.call_id === 'string'
+            ? item.call_id
+            : typeof item.id === 'string'
+              ? item.id
+              : typeof parsed.item_id === 'string'
+                ? parsed.item_id
+                : '';
+          if (key) {
+            ensureFunctionCall(key, {
+              id: typeof item.call_id === 'string' ? item.call_id : key,
+              name: typeof item.name === 'string' ? item.name : '',
+              arguments: typeof item.arguments === 'string' ? item.arguments : '',
+              outputIndex: typeof parsed.output_index === 'number' ? parsed.output_index : 0,
+            });
+          }
+        }
+        continue;
+      }
+
+      if (eventType === 'response.function_call_arguments.delta') {
+        const key = typeof parsed.item_id === 'string'
+          ? parsed.item_id
+          : typeof parsed.call_id === 'string'
+            ? parsed.call_id
+            : '';
+        if (!key) {
+          continue;
+        }
+        const current = ensureFunctionCall(key, {
+          outputIndex: typeof parsed.output_index === 'number' ? parsed.output_index : 0,
+        });
+        if (typeof parsed.delta === 'string') {
+          current.arguments += parsed.delta;
+          functionCalls.set(key, current);
+        }
+        continue;
+      }
+
+      if (eventType === 'response.function_call_arguments.done') {
+        const key = typeof parsed.item_id === 'string'
+          ? parsed.item_id
+          : typeof parsed.call_id === 'string'
+            ? parsed.call_id
+            : '';
+        if (!key) {
+          continue;
+        }
+        const current = ensureFunctionCall(key, {
+          outputIndex: typeof parsed.output_index === 'number' ? parsed.output_index : 0,
+        });
+        if (typeof parsed.arguments === 'string') {
+          current.arguments = parsed.arguments;
+          functionCalls.set(key, current);
+        }
+        emittedToolCall = true;
+        yield `data: ${JSON.stringify({
+          id: responseId,
+          object: 'chat.completion.chunk',
+          model,
+          choices: [{
+            index: 0,
+            delta: {
+              tool_calls: [{
+                index: current.outputIndex,
+                id: current.id,
+                type: 'function',
+                function: {
+                  name: current.name,
+                  arguments: current.arguments,
+                },
+              }],
+            },
+          }],
+        })}\n\n`;
+        continue;
+      }
+
+      if (eventType === 'response.completed') {
+        yield `data: ${JSON.stringify({
+          id: responseId,
+          object: 'chat.completion.chunk',
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: emittedToolCall ? 'tool_calls' : 'stop' }],
+        })}\n\n`;
+        yield 'data: [DONE]\n\n';
+      }
+    }
+  }
+}
+
 async function fetchJsonUpstream(args: {
   url: string;
   headers: Record<string, string>;
@@ -714,10 +934,11 @@ function createOpenAIResponsesFetch(provider: RouterProviderConfig, timeoutMs: n
     const model = stripLrPrefix(requestBody.model) ?? '';
     const normalizedTools = normalizeResponsesTools(requestBody.tools);
     const upstreamUrl = `${baseUrl.replace(/\/$/, '')}/responses`;
+    const streaming = streamRequested(requestBody);
     const upstreamBody = {
       model,
       input: buildResponsesInput(requestBody.messages),
-      stream: false,
+      stream: streaming,
       ...(normalizedTools ? { tools: normalizedTools } : {}),
       ...(requestBody.tool_choice !== undefined ? { tool_choice: requestBody.tool_choice } : {}),
       ...(requestBody.parallel_tool_calls !== undefined ? { parallel_tool_calls: requestBody.parallel_tool_calls } : {}),
@@ -734,7 +955,8 @@ function createOpenAIResponsesFetch(provider: RouterProviderConfig, timeoutMs: n
 
     const loadPayload = createLazyPayloadLoader(response.clone());
     const loadBodyText = createLazyTextLoader(response.clone());
-    const headers = streamRequested(requestBody)
+    const contentType = response.headers.get('content-type') ?? '';
+    const headers = streaming
       ? { 'content-type': 'text/event-stream; charset=utf-8' }
       : { 'content-type': 'application/json; charset=utf-8' };
 
@@ -742,10 +964,48 @@ function createOpenAIResponsesFetch(provider: RouterProviderConfig, timeoutMs: n
       status: response.status,
       headers,
       json: async () => adaptResponsesPayloadToChatCompletions(await loadPayload(), model),
-      textStream: streamRequested(requestBody)
-        ? adaptResponsesPayloadToChatCompletionsStream(loadPayload(), model)
+      textStream: streaming
+        ? (response.body && contentType.toLowerCase().includes('text/event-stream')
+            ? adaptResponsesSseToChatCompletionsStream(readableStreamToTextChunks(response.body), model)
+            : adaptResponsesPayloadToChatCompletionsStream(loadPayload(), model))
         : undefined,
-      usage: async () => extractTokenUsageFromPayload(await loadPayload()),
+      usage: streaming ? undefined : async () => extractTokenUsageFromPayload(await loadPayload()),
+      bodyText: async () => loadBodyText(),
+      upstreamUrl,
+    };
+  };
+}
+
+function createOpenAIResponsesPassthroughFetch(provider: RouterProviderConfig, timeoutMs: number): FetchUpstream {
+  if (!provider.baseUrl) {
+    throw new Error('Provider baseUrl is required for openai-responses upstreams.');
+  }
+
+  const baseUrl = provider.baseUrl;
+
+  return async ({ body, requestId }) => {
+    const requestBody = body as Record<string, unknown>;
+    const upstreamUrl = `${baseUrl.replace(/\/$/, '')}/responses`;
+
+    const response = await fetchJsonUpstream({
+      url: upstreamUrl,
+      headers: buildRequestHeaders(provider, requestId),
+      body: requestBody,
+      timeoutMs,
+    });
+
+    const loadPayload = createLazyPayloadLoader(response.clone());
+    const loadBodyText = createLazyTextLoader(response.clone());
+
+    return {
+      status: response.status,
+      headers: streamRequested(requestBody)
+        ? { 'content-type': 'text/event-stream; charset=utf-8' }
+        : responseHeadersToRecord(response.headers),
+      json: async () => loadPayload(),
+      textStream: streamRequested(requestBody) && response.body
+        ? sanitizeResponsesSseStream(readableStreamToTextChunks(response.body))
+        : undefined,
       bodyText: async () => loadBodyText(),
       upstreamUrl,
     };
@@ -805,6 +1065,55 @@ export function createProviderAwareFetch(
     }
 
     const upstream = await createOpenAICompletionsFetch(provider, fallback.timeoutMs)({
+      ...args,
+      body: upstreamBody,
+    });
+    return {
+      ...upstream,
+      providerId: selection.providerId,
+      thinkingTrace: finalThinkingTrace,
+    };
+  };
+}
+
+export function createProviderAwareResponsesPassthrough(
+  providers: Record<string, RouterProviderConfig>,
+  fallback: FallbackUpstreamConfig,
+  thinkingConfig?: RouterThinkingConfig,
+): FetchUpstream {
+  const fallbackFetch = fallback.baseUrl
+    ? createOpenAIResponsesPassthroughFetch(
+        {
+          api: 'openai-responses',
+          baseUrl: fallback.baseUrl,
+          apiKey: fallback.apiKey,
+        },
+        fallback.timeoutMs,
+      )
+    : null;
+
+  return async (args) => {
+    const selection = resolveProviderSelection((args.body as Record<string, unknown>)?.model, providers);
+    if (!selection) {
+      if (fallbackFetch) {
+        return fallbackFetch(args);
+      }
+      throw new Error(`No upstream provider configured for model: ${String((args.body as Record<string, unknown>)?.model ?? 'unknown')}`);
+    }
+
+    const provider = selection.provider;
+    if (provider.api && provider.api !== 'openai-responses') {
+      throw new Error(`Provider ${selection.providerId} does not support /v1/responses passthrough.`);
+    }
+
+    const rewriteResult = rewriteThinking(args.body as Record<string, unknown>, thinkingConfig);
+    const upstreamBody = {
+      ...rewriteResult.body,
+      model: selection.upstreamModel,
+    };
+    const finalThinkingTrace = buildThinkingTrace(args.body as Record<string, unknown>, upstreamBody);
+
+    const upstream = await createOpenAIResponsesPassthroughFetch(provider, fallback.timeoutMs)({
       ...args,
       body: upstreamBody,
     });

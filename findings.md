@@ -49,6 +49,22 @@
   - stream commit followed by post-commit interruption without double-send
   - timeout exhaustion surfacing as explicit `upstream_retry_exhausted` instead of ambiguous success
   - JSONL + SQLite traces being sufficient to explain attempts, classifications, commit state, and final error outcome for both success and failure cases
+- 2026-03-28 routing audit findings:
+  - the actual mapping surface is split across `providers.*.models`, `models.allow`, ingress alias normalization, and provider-aware upstream code rather than one explicit route table
+  - `LR/ms` is implemented as a hardcoded ingress special case instead of declarative config
+  - implicit provider selection can become order-dependent if duplicate model IDs are introduced across providers
+  - thinking rewrite runs before provider branching and is therefore broader than the current codex-specific need
+  - `config/router.json` currently contains inline provider API keys
+  - naming is inconsistent across runtime, docs, and integration helpers: `Q-router`, `qingfu-router`, `Q_ROUTER_*`, `QINGFU_*`, `.qingfu-router`, `.Q-router`, and `x-qingfu-request-id`
+  - the trace directory default in `src/traces/store.ts` (`.Q-router`) does not match the checked-in config value (`.qingfu-router`)
+  - docs still describe `QINGFU_*` env vars, but runtime code actually reads `Q_ROUTER_*`, `Q_UPSTREAM_*`, and `Q_<PROVIDER>_API_KEY`
+- 2026-03-28 implementation follow-up:
+  - the runtime now supports explicit `routes` in addition to the legacy `providers + models.allow` structure
+  - if `routes` is present and `models.allow` is omitted, the allow-list is derived from route aliases
+  - provider secrets can now be bound via `apiKeyEnv`
+  - runtime now accepts legacy `QINGFU_*` env names as compatibility aliases while keeping `Q_ROUTER_*` / `Q_UPSTREAM_*` / `Q_TRACE_*` as primary names
+  - `/debug/routes` now exposes the effective alias -> provider -> upstream endpoint mapping with redacted key info
+  - `LR/ms` routing is no longer hardcoded in the handler; it is resolved through the compiled routing table, with legacy behavior auto-derived when no explicit route exists
 
 ## Technical Decisions
 | Decision | Rationale |
@@ -69,12 +85,15 @@
 | Add a targeted verification matrix for pseudo-success and pre-commit failures | Prevents the design from only testing ordinary timeout/HTTP cases |
 | **Do not implement `/v1/responses` in v1** | A dedicated router provider with `api: "openai-completions"` keeps the integration narrower, matches the current prototype, and avoids cloning Responses semantics before they are proven necessary |
 | Introduce `qingfuCodex/gpt-5.4` instead of mutating the live `codex/gpt-5.4` provider in place | This preserves rollback simplicity and avoids conflating current production routing with the new router path |
+| Capture the routing review in a dedicated audit doc instead of mixing it into older build notes | The current request is about code structure and model mapping, not another implementation phase |
+| Implement the structural improvements as backward-compatible additions instead of in-place config migration | The user explicitly required that the currently running Q-router must not be affected |
 
 ## Issues Encountered
 | Issue | Resolution |
 |-------|------------|
 | Initial `docs/config.md` draft used the wrong provider API label (`openai-chat-completions`) | Corrected to the real OpenClaw adapter name: `openai-completions` |
 | Existing live `codex` provider uses `api: "openai-responses"`, which would force `/v1/responses` if reused directly | Chose a new dedicated router provider entry (`qingfuCodex`) using `api: "openai-completions"` |
+| Runtime env names and documentation env names diverged | Captured the mismatch in the routing audit and recommended namespace unification |
 
 ## Resources
 - Skill: `/home/seax/.openclaw/skills/planning-with-files/SKILL.md`
@@ -88,6 +107,11 @@
   - `docs/providers/sglang.md`
   - `docs/providers/openrouter.md`
   - `docs/gateway/configuration-reference.md`
+- Audit output:
+  - `docs/model-routing-audit.md`
+- Implementation updates:
+  - `src/routing/routes.ts`
+  - `GET /debug/routes`
 
 ## Visual/Browser Findings
 - None yet.

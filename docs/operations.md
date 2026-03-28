@@ -22,6 +22,13 @@ node dist/server.js
 ### Verify listener
 Check that the router is reachable on the configured host/port, e.g. `127.0.0.1:4318`.
 
+### Verify effective routing
+Inspect:
+- `GET /health`
+- `GET /debug/routes`
+
+`/debug/routes` is the quickest way to confirm which aliases, providers, upstream endpoints, auth modes, and route strategies are currently active.
+
 ### Verify OpenClaw path
 - confirm the dedicated provider entry points at qingfu-router,
 - send one narrow test request through that provider path,
@@ -41,6 +48,7 @@ A suspicious request includes any of:
 - repeated `empty_success`,
 - repeated timeouts on same model,
 - repeated `alias_model_rotated` events for `LR/ms`,
+- unexpected route/provider resolution in `/debug/routes`,
 - post-commit upstream failures,
 - no traces for a request that should have passed through router.
 

@@ -187,14 +187,65 @@
 | 2026-03-24 11:48 | `chat-completions.ts` contained stray duplicated fragments after an edit, causing parse failures during verification | 1 | Removed the duplicated fragment and re-ran the suite |
 | 2026-03-24 11:49 | Timeout test exposed missing source helper wiring (`classifyThrownUpstreamError is not defined`) | 1 | Added the helper in the correct scope, re-ran src-level reproduction, then re-ran tests/build successfully |
 
+## Session: 2026-03-28
+
+### Phase 7: Delivery / Routing Audit
+- **Status:** complete
+- **Started:** 2026-03-28 15:00 Asia/Shanghai
+- **Completed:** 2026-03-28 15:31 Asia/Shanghai
+- Actions taken:
+  - Re-read the real Q-router repository instead of the earlier docs-only knowledge-base folder.
+  - Traced the routing chain from ingress model alias normalization to provider selection, upstream URL construction, auth header generation, and thinking rewrite.
+  - Verified current runtime behavior with focused routing/config tests.
+  - Wrote `docs/model-routing-audit.md` to capture the current mapping table and prioritized improvement plan.
+- Files created/modified:
+  - `docs/model-routing-audit.md` (created)
+  - `findings.md` (updated with routing-audit conclusions)
+  - `progress.md` (updated)
+
+### Phase 8: Backward-Compatible Routing Refactor
+- **Status:** complete
+- **Started:** 2026-03-28 15:32 Asia/Shanghai
+- **Completed:** 2026-03-28 16:03 Asia/Shanghai
+- Actions taken:
+  - Added explicit `routes` support while preserving the old `providers + models.allow` config path.
+  - Added `apiKeyEnv` support for provider secrets and kept the old derived env naming as fallback.
+  - Added compatibility support for legacy `QINGFU_*` env names without removing the current `Q_*` names.
+  - Introduced a compiled routing layer and wired it into server startup, provider-aware fetch, and `LR/ms` alias handling.
+  - Added `GET /debug/routes` for effective route inspection and non-blocking config warnings.
+  - Updated config/operations docs to describe the new compatibility surface.
+  - Kept the checked-in runtime config unchanged so the currently running instance does not require migration.
+- Files created/modified:
+  - `src/config/router.ts`
+  - `src/routing/routes.ts` (created)
+  - `src/server.ts`
+  - `src/upstream/client.ts`
+  - `src/ingress/chat-completions.ts`
+  - `src/ingress/responses.ts`
+  - `src/traces/store.ts`
+  - `src/tests/router-config.test.ts`
+  - `src/tests/provider-routing.test.ts`
+  - `docs/config.md`
+  - `docs/operations.md`
+  - `findings.md`
+  - `progress.md`
+
+## Additional Test Results
+| Test | Input | Expected | Actual | Status |
+|------|-------|----------|--------|--------|
+| Routing/config audit verification | `npm test -- src/tests/provider-routing.test.ts src/tests/router-config.test.ts` | Current provider routing, auth, think rewrite, and alias behavior still pass | 25 tests passed | ✓ |
+| Backward-compatible refactor verification | `npm test -- src/tests/router-config.test.ts src/tests/provider-routing.test.ts` | Old routing behavior remains green and new `routes` / `apiKeyEnv` features work | 29 tests passed | ✓ |
+| Full regression suite after refactor | `npm test` | No regression across classifier, integration, routing, and OpenClaw config helpers | 50 tests passed | ✓ |
+| Build after refactor | `npm run build` | Compile cleanly after route-layer changes | `tsc -p tsconfig.json` passed | ✓ |
+
 ## 5-Question Reboot Check
 | Question | Answer |
 |----------|--------|
-| Where am I? | Entering Phase 7: Delivery |
-| Where am I going? | Delivery → branch completion |
-| What's the goal? | Build a local OpenAI-compatible gateway for OpenClaw that retries `gpt-5.4` in place and blocks empty-success from surfacing as blank success |
-| What have I learned? | The hard part was not only retry logic, but making post-commit behavior and request forensics explicit enough that failures can never masquerade as silent success |
-| What have I done? | Completed verification/hardening with green tests for normal success, timeout retry, empty-success retry, post-commit no-double-send, explicit exhaustion, and trace sufficiency |
+| Where am I? | Audit and backward-compatible refactor complete |
+| Where am I going? | User handoff and any requested config migration or cleanup work |
+| What's the goal? | Keep the current Q-router stable while making routing and secret binding more explicit |
+| What have I learned? | The safest path was additive: introduce explicit routes and key binding without forcing immediate config migration |
+| What have I done? | Completed the audit, implemented the compatibility refactor, updated docs, and re-ran the full suite |
 
 ---
 *Update after completing each phase or encountering errors*

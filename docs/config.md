@@ -9,6 +9,38 @@ This document defines the intended configuration surface for qingfu-router and t
 - Make retry behavior explicit and inspectable.
 - Make observability configurable but enabled by default in development.
 
+## Current Runtime Reality
+The current code now supports two config styles:
+- legacy style: `providers` + `models.allow`
+- explicit style: `providers` + `routes`
+
+Compatibility rules:
+- existing `config/router.json` keeps working unchanged
+- if `routes` is present and `models.allow` is omitted, the allow-list is derived from route aliases
+- provider secrets can now be declared with `apiKeyEnv`
+- legacy `QINGFU_*` env names are accepted as compatibility aliases, but `Q_ROUTER_*`, `Q_UPSTREAM_*`, and `Q_TRACE_*` are the primary runtime names
+
+Example explicit route shape:
+```json
+{
+  "providers": {
+    "codex": {
+      "api": "openai-responses",
+      "baseUrl": "https://codex.example.test/v1",
+      "apiKeyEnv": "Q_CODEX_API_KEY"
+    }
+  },
+  "routes": [
+    {
+      "id": "codex-main",
+      "provider": "codex",
+      "aliases": ["LR/gpt-5.4", "gpt-5.4", "codex/gpt-5.4"],
+      "model": "gpt-5.4"
+    }
+  ]
+}
+```
+
 ## Router Config Layers
 ### 1. Environment variables
 Good for secrets and deployment-specific values.
@@ -134,6 +166,13 @@ With the example above, the rule is stored but inactive until `mappingsEnabled` 
 - `auth: "api-key"` + `authHeader: false` => send `x-api-key: <apiKey>`
 - `auth: "token"` / `auth: "oauth"` => send `Authorization: Bearer <apiKey>`
 - explicit entries in `headers` are preserved and are not overwritten by generated auth headers
+- `apiKeyEnv` now overrides derived env lookup and is the preferred way to bind provider secrets
+
+## Debugging Effective Routes
+The router now exposes:
+- `GET /debug/routes`
+
+Use it to inspect the effective alias -> provider -> upstream endpoint -> auth mode mapping without exposing secret values.
 
 ## OpenClaw Integration Config
 ### Strategy

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { chdir, cwd } from 'node:process';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { loadRouterRuntimeConfig } from '../config/router.js';
+import { resetRoutingState } from '../routing/routes.js';
 import { buildApp } from '../server.js';
 
 const originalCwd = cwd();
@@ -41,6 +42,7 @@ afterEach(() => {
   for (const key of envKeys) {
     delete process.env[key];
   }
+  resetRoutingState();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   globalThis.fetch = originalFetch;
@@ -231,6 +233,90 @@ describe('provider-aware upstream routing', () => {
 
     const body = JSON.parse(String(init.body));
     expect(body).toMatchObject({
+      model: 'gpt-5.4',
+      stream: false,
+    });
+
+    await app.close();
+  });
+
+  test('routes explicit route aliases through the configured provider without legacy models.allow', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        codex: {
+          api: 'openai-responses',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://codex.example.test/v1',
+          models: [
+            {
+              id: 'gpt-5.4',
+              name: 'GPT-5.4',
+            },
+          ],
+        },
+      },
+      routes: [
+        {
+          id: 'explicit-codex-main',
+          provider: 'codex',
+          aliases: ['writer/gpt54'],
+          model: 'gpt-5.4',
+        },
+      ],
+    });
+
+    chdir(dir);
+    process.env.Q_CODEX_API_KEY = 'codex-secret';
+
+    const fetchSpy = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'resp-explicit-route',
+          output: [
+            {
+              type: 'message',
+              role: 'assistant',
+              content: [
+                {
+                  type: 'output_text',
+                  text: 'explicit route ok',
+                },
+              ],
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'writer/gpt54',
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('https://codex.example.test/v1/responses');
+    expect(init.headers).toMatchObject({
+      authorization: 'Bearer codex-secret',
+    });
+    expect(JSON.parse(String(init.body))).toMatchObject({
       model: 'gpt-5.4',
       stream: false,
     });
@@ -1628,7 +1714,7 @@ describe('provider-aware upstream routing', () => {
     await app.close();
   });
 
-  test('routes repeated LR/ms requests through modelscope in round-robin order', async () => {
+  test('pins repeated LR/ms requests to the same modelscope backend until failover', async () => {
     const dir = writeRouterConfig({
       providers: {
         modelscope: {
@@ -1653,7 +1739,7 @@ describe('provider-aware upstream routing', () => {
     const fetchSpy = vi.fn(async () => {
       return new Response(
         JSON.stringify({
-          id: 'resp-modelscope-round-robin',
+          id: 'resp-modelscope-sticky',
           choices: [
             {
               message: {
@@ -1691,16 +1777,11 @@ describe('provider-aware upstream routing', () => {
     }
 
     expect(fetchSpy).toHaveBeenCalledTimes(modelScopePool.length);
-
     const routedModels = fetchSpy.mock.calls.map((call) => {
       const [, init] = call as unknown as [string, RequestInit];
       return JSON.parse(String(init.body)).model as string;
     });
-    const firstIndex = modelScopePool.indexOf(routedModels[0] as (typeof modelScopePool)[number]);
-    expect(firstIndex).toBeGreaterThanOrEqual(0);
-    expect(routedModels).toEqual(
-      modelScopePool.map((_, offset) => modelScopePool[(firstIndex + offset) % modelScopePool.length]),
-    );
+    expect(routedModels).toEqual(Array(modelScopePool.length).fill(modelScopePool[0]));
 
     const [firstUrl, firstInit] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
     expect(firstUrl).toBe('https://modelscope.example.test/v1/chat/completions');
@@ -1777,7 +1858,7 @@ describe('provider-aware upstream routing', () => {
     await app.close();
   });
 
-  test('retries LR/ms quota failures by rotating to the next modelscope backend', async () => {
+  test('retries LR/ms on the same backend before switching the sticky active model', async () => {
     const dir = writeRouterConfig({
       providers: {
         modelscope: {
@@ -1799,8 +1880,9 @@ describe('provider-aware upstream routing', () => {
     chdir(dir);
     process.env.Q_MODELSCOPE_API_KEY = 'ms-secret';
 
-    const fetchSpy = vi.fn(async () => {
-      if (fetchSpy.mock.calls.length === 1) {
+    const fetchSpy = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const requestModel = JSON.parse(String(init?.body ?? '{}')).model as string;
+      if (requestModel === modelScopePool[0]) {
         return new Response(
           JSON.stringify({
             error: {
@@ -1842,12 +1924,12 @@ describe('provider-aware upstream routing', () => {
     const app = buildApp({
       routerConfig: loadRouterRuntimeConfig(),
       retryPolicy: {
-        maxAttempts: 2,
+        maxAttempts: 3,
         backoffMs: () => 0,
       },
     });
 
-    const response = await app.inject({
+    const failedResponse = await app.inject({
       method: 'POST',
       url: '/v1/chat/completions',
       payload: {
@@ -1856,8 +1938,19 @@ describe('provider-aware upstream routing', () => {
       },
     });
 
-    expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({
+    expect(failedResponse.statusCode).toBe(502);
+
+    const recoveredResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'LR/ms',
+        messages: [{ role: 'user', content: 'try next backend' }],
+      },
+    });
+
+    expect(recoveredResponse.statusCode).toBe(200);
+    expect(recoveredResponse.json()).toMatchObject({
       id: 'resp-modelscope-recovered',
       choices: [
         {
@@ -1869,15 +1962,96 @@ describe('provider-aware upstream routing', () => {
       ],
     });
 
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(fetchSpy).toHaveBeenCalledTimes(4);
 
     const routedModels = fetchSpy.mock.calls.map((call) => {
       const [, init] = call as unknown as [string, RequestInit];
       return JSON.parse(String(init.body)).model as string;
     });
-    const firstIndex = modelScopePool.indexOf(routedModels[0] as (typeof modelScopePool)[number]);
-    expect(firstIndex).toBeGreaterThanOrEqual(0);
-    expect(routedModels[1]).toBe(modelScopePool[(firstIndex + 1) % modelScopePool.length]);
+    expect(routedModels.slice(0, 3)).toEqual([
+      modelScopePool[0],
+      modelScopePool[0],
+      modelScopePool[0],
+    ]);
+    expect(routedModels[3]).toBe(modelScopePool[1]);
+
+    await app.close();
+  });
+
+  test('routes explicit round-robin aliases without relying on hardcoded allow-list wiring', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        modelscope: {
+          api: 'openai-completions',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://modelscope.example.test/v1',
+          models: modelScopePool.map((id) => ({
+            id,
+            name: id,
+          })),
+        },
+      },
+      routes: [
+        {
+          id: 'explicit-ms-pool',
+          provider: 'modelscope',
+          strategy: 'round-robin',
+          aliases: ['LR/ms', 'ms'],
+          members: [...modelScopePool],
+        },
+      ],
+    });
+
+    chdir(dir);
+    process.env.Q_MODELSCOPE_API_KEY = 'ms-secret';
+
+    const fetchSpy = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'resp-explicit-ms-route',
+          choices: [
+            {
+              message: {
+                role: 'assistant',
+                content: 'ok',
+              },
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+    });
+
+    for (let index = 0; index < 2; index += 1) {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        payload: {
+          model: 'ms',
+          messages: [{ role: 'user', content: `hi ${index}` }],
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+    }
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    const routedModels = fetchSpy.mock.calls.map((call) => {
+      const [, init] = call as unknown as [string, RequestInit];
+      return JSON.parse(String(init.body)).model as string;
+    });
+    expect(routedModels).toEqual([modelScopePool[0], modelScopePool[1]]);
 
     await app.close();
   });

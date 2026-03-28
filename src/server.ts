@@ -2,6 +2,7 @@ import Fastify from 'fastify';
 import { loadRouterRuntimeConfig, type RouterRuntimeConfig } from './config/router.js';
 import { createChatCompletionsHandler, type RetryPolicy } from './ingress/chat-completions.js';
 import { createResponsesHandler } from './ingress/responses.js';
+import { compileRoutingTable, describeProviderAuth } from './routing/routes.js';
 import { createNoopTraceStore, createTraceStore, resolveTracePaths, type TraceStore } from './traces/store.js';
 import { createFetchUpstream, createProviderAwareFetch, createProviderAwareResponsesPassthrough, type FetchUpstream } from './upstream/client.js';
 
@@ -16,10 +17,20 @@ const defaultRetryPolicy: RetryPolicy = {
   maxAttempts: 3,
   backoffMs: () => 0,
 };
+const emittedConfigWarnings = new Set<string>();
 
 export function buildApp(options: BuildAppOptions = {}) {
   const app = Fastify();
   const routerConfig = options.routerConfig ?? loadRouterRuntimeConfig();
+  const routingTable = compileRoutingTable(routerConfig);
+
+  for (const warning of routingTable.warnings) {
+    if (emittedConfigWarnings.has(warning)) {
+      continue;
+    }
+    emittedConfigWarnings.add(warning);
+    console.warn(`[Q-router] ${warning}`);
+  }
 
   const fetchUpstream =
     options.fetchUpstream ??
@@ -28,7 +39,7 @@ export function buildApp(options: BuildAppOptions = {}) {
           baseUrl: routerConfig.upstream.baseUrl,
           apiKey: routerConfig.upstream.apiKey,
           timeoutMs: routerConfig.upstream.timeoutMs,
-        }, routerConfig.thinking)
+        }, routerConfig.thinking, routingTable.routes)
       : routerConfig.upstream.baseUrl
         ? createFetchUpstream(
             routerConfig.upstream.baseUrl,
@@ -45,7 +56,7 @@ export function buildApp(options: BuildAppOptions = {}) {
           baseUrl: routerConfig.upstream.baseUrl,
           apiKey: routerConfig.upstream.apiKey,
           timeoutMs: routerConfig.upstream.timeoutMs,
-        }, routerConfig.thinking)
+        }, routerConfig.thinking, routingTable.routes)
       : fetchUpstream;
 
   const traceStore =
@@ -64,9 +75,14 @@ export function buildApp(options: BuildAppOptions = {}) {
     traceStore.close();
   });
 
+  const effectiveAllowedModels =
+    routerConfig.models.allow.length > 0
+      ? routerConfig.models.allow
+      : routingTable.routes.flatMap((route) => route.aliases);
+
   const allowedModels =
     options.routerConfig || !options.fetchUpstream
-      ? new Set(routerConfig.models.allow)
+      ? new Set(effectiveAllowedModels)
       : undefined;
 
   app.get('/health', async () => ({
@@ -77,7 +93,37 @@ export function buildApp(options: BuildAppOptions = {}) {
     server: routerConfig.server,
     providers: Object.keys(routerConfig.providers),
     modelsAllowCount: routerConfig.models.allow.length,
+    effectiveModelsAllowCount: effectiveAllowedModels.length,
     traces: routerConfig.traces,
+    warnings: routingTable.warnings,
+  }));
+
+  app.get('/debug/routes', async () => ({
+    warnings: routingTable.warnings,
+    routes: routingTable.routes.map((route) => {
+      const provider = routerConfig.providers[route.providerId];
+      const providerBaseUrl = provider?.baseUrl?.replace(/\/$/, '') ?? null;
+      return {
+        id: route.id,
+        source: route.source,
+        strategy: route.strategy,
+        aliases: route.aliases,
+        providerId: route.providerId,
+        providerApi: provider?.api ?? null,
+        providerBaseUrl,
+        authMode: provider ? describeProviderAuth(provider) : null,
+        apiKeySource: provider?.apiKeySource ?? null,
+        upstreamEndpoint:
+          providerBaseUrl && provider?.api === 'openai-responses'
+            ? `${providerBaseUrl}/responses`
+            : providerBaseUrl
+              ? `${providerBaseUrl}/chat/completions`
+              : null,
+        ...(route.strategy === 'direct'
+          ? { upstreamModel: route.upstreamModel ?? null }
+          : { members: route.members ?? [] }),
+      };
+    }),
   }));
 
   app.get('/stats/tokens/daily', async (request) => {
@@ -111,6 +157,7 @@ export function buildApp(options: BuildAppOptions = {}) {
       retryPolicy: options.retryPolicy ?? defaultRetryPolicy,
       traceStore,
       allowedModels,
+      routes: routingTable.routes,
     }),
   );
 
@@ -120,6 +167,7 @@ export function buildApp(options: BuildAppOptions = {}) {
       fetchUpstream: fetchResponsesUpstream,
       traceStore,
       allowedModels,
+      routes: routingTable.routes,
     }),
   );
 

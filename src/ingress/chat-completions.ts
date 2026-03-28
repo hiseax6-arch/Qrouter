@@ -21,16 +21,15 @@ import {
   buildAllowedModelCandidates,
   resolveRequestedModelAlias,
 } from './model-normalization.js';
+import type { CompiledRoute } from '../routing/routes.js';
+import {
+  advanceStickyFailoverRoute,
+  rotateRoundRobinRoute,
+  selectRoundRobinRoute,
+  selectStickyFailoverRoute,
+} from '../routing/routes.js';
 import { nowTraceTimestamp, type TraceStore } from '../traces/store.js';
 import type { FetchUpstream, UpstreamResponse } from '../upstream/client.js';
-
-let msRoundRobinIndex = 0;
-const MODELSCOPE_MODEL_POOL = [
-  'MiniMax/MiniMax-M2.5',
-  'ZhipuAI/GLM-5',
-  'Qwen/Qwen3-235B-A22B',
-  'moonshotai/Kimi-K2.5',
-] as const;
 
 export type RetryPolicy = {
   maxAttempts: number;
@@ -42,6 +41,7 @@ export type ChatCompletionsDeps = {
   retryPolicy: RetryPolicy;
   traceStore: TraceStore;
   allowedModels?: Set<string>;
+  routes?: CompiledRoute[];
 };
 
 type ChatCompletionsRequestBody = {
@@ -383,35 +383,67 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
       body.model = requestedModel;
     }
     let model = requestedModel;
-    let modelScopePoolIndex: number | null = null;
+    let multiRoute: CompiledRoute | null = null;
+    let multiRouteMemberIndex: number | null = null;
 
-    // Handle LR/ms round-robin selection
-    if (requestedModel === 'LR/ms') {
-      modelScopePoolIndex = msRoundRobinIndex % MODELSCOPE_MODEL_POOL.length;
-      const chosen = MODELSCOPE_MODEL_POOL[modelScopePoolIndex];
-      msRoundRobinIndex++;
-      body.model = chosen;
-      model = chosen;
+    const multiRouteSelection =
+      selectRoundRobinRoute(requestedModel, deps.routes ?? [])
+      ?? selectStickyFailoverRoute(requestedModel, deps.routes ?? []);
+    if (multiRouteSelection) {
+      multiRoute = multiRouteSelection.route;
+      multiRouteMemberIndex = multiRouteSelection.memberIndex;
+      body.model = multiRouteSelection.upstreamModel;
+      model = multiRouteSelection.upstreamModel;
     }
 
     const stream = isStreamingRequest(body);
 
-    function advanceModelScopeFallback(nextAttempt: number, reason: string) {
-      if (requestedModel !== 'LR/ms' || modelScopePoolIndex === null || MODELSCOPE_MODEL_POOL.length < 2) {
+    function advanceAliasFallback(nextAttempt: number, reason: string) {
+      if (!multiRoute || multiRouteMemberIndex === null || multiRoute.strategy !== 'round-robin') {
+        return;
+      }
+
+      const nextSelection = rotateRoundRobinRoute(multiRoute, multiRouteMemberIndex);
+      if (!nextSelection) {
         return;
       }
 
       const previousModel = model;
-      modelScopePoolIndex = (modelScopePoolIndex + 1) % MODELSCOPE_MODEL_POOL.length;
-      model = MODELSCOPE_MODEL_POOL[modelScopePoolIndex];
+      multiRouteMemberIndex = nextSelection.memberIndex;
+      model = nextSelection.upstreamModel;
       body.model = model;
 
       deps.traceStore.appendEvent(
         buildTraceEvent(requestId, 'alias_model_rotated', {
           attempt: nextAttempt,
           requestedModel,
+          routeId: multiRoute.id,
           previousModel,
           model,
+          stream,
+          classification: reason,
+        }),
+      );
+    }
+
+    function advanceStickyAliasAfterFailure(attempt: number, reason: string) {
+      if (!multiRoute || multiRouteMemberIndex === null || multiRoute.strategy !== 'sticky-failover') {
+        return;
+      }
+
+      const previousModel = model;
+      const nextSelection = advanceStickyFailoverRoute(multiRoute, multiRouteMemberIndex);
+      if (!nextSelection) {
+        return;
+      }
+
+      deps.traceStore.appendEvent(
+        buildTraceEvent(requestId, 'alias_model_rotated', {
+          attempt,
+          requestedModel,
+          routeId: multiRoute.id,
+          previousModel,
+          model: nextSelection.upstreamModel,
           stream,
           classification: reason,
         }),
@@ -520,6 +552,7 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
             stream,
             status: upstream.status,
             ...(upstream.providerId ? { providerId: upstream.providerId } : {}),
+            ...(upstream.routeId ? { routeId: upstream.routeId } : {}),
             ...(upstream.upstreamUrl ? { upstreamUrl: upstream.upstreamUrl } : {}),
           }),
         );
@@ -531,6 +564,7 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
               model,
               stream,
               ...(upstream.providerId ? { providerId: upstream.providerId } : {}),
+              ...(upstream.routeId ? { routeId: upstream.routeId } : {}),
               ...(upstream.upstreamUrl ? { upstreamUrl: upstream.upstreamUrl } : {}),
               ...upstream.thinkingTrace,
             }),
@@ -546,6 +580,7 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
               status: upstream.status,
               retryable: shouldRetryStatus(upstream.status, lastUpstreamError),
               ...(upstream.providerId ? { providerId: upstream.providerId } : {}),
+              ...(upstream.routeId ? { routeId: upstream.routeId } : {}),
               ...(upstream.upstreamUrl ? { upstreamUrl: upstream.upstreamUrl } : {}),
               ...(lastUpstreamError.type ? { upstreamErrorType: lastUpstreamError.type } : {}),
               ...(lastUpstreamError.code ? { upstreamErrorCode: lastUpstreamError.code } : {}),
@@ -670,11 +705,12 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
           }
 
           if (attempt < deps.retryPolicy.maxAttempts) {
-            advanceModelScopeFallback(attempt + 1, finalClassification);
+            advanceAliasFallback(attempt + 1, finalClassification);
             await sleep(deps.retryPolicy.backoffMs(attempt, finalClassification));
             continue;
           }
 
+          advanceStickyAliasAfterFailure(attempt, finalClassification);
           recordSummary(attempt);
           appendRequestCompleted(attempt);
           return reply.code(502).send(
@@ -698,11 +734,12 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
           );
 
           if (attempt < deps.retryPolicy.maxAttempts) {
-            advanceModelScopeFallback(attempt + 1, finalClassification);
+            advanceAliasFallback(attempt + 1, finalClassification);
             await sleep(deps.retryPolicy.backoffMs(attempt, finalClassification));
             continue;
           }
 
+          advanceStickyAliasAfterFailure(attempt, finalClassification);
           recordSummary(attempt);
           appendRequestCompleted(attempt);
           return reply.code(502).send(
@@ -718,6 +755,7 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
 
         finalClassification = `http_${upstream.status}`;
         errorClass = finalClassification;
+        advanceStickyAliasAfterFailure(attempt, finalClassification);
         recordSummary(attempt);
         appendRequestCompleted(attempt);
         return reply.code(upstream.status).send(
@@ -742,11 +780,12 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
         );
 
         if (attempt < deps.retryPolicy.maxAttempts) {
-          advanceModelScopeFallback(attempt + 1, finalClassification);
+          advanceAliasFallback(attempt + 1, finalClassification);
           await sleep(deps.retryPolicy.backoffMs(attempt, finalClassification));
           continue;
         }
 
+        advanceStickyAliasAfterFailure(attempt, finalClassification);
         recordSummary(attempt);
         appendRequestCompleted(attempt);
         return reply.code(502).send(

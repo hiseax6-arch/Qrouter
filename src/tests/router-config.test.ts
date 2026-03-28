@@ -11,9 +11,22 @@ const envKeys = [
   'Q_ROUTER_CONFIG_PATH',
   'Q_ROUTER_PORT',
   'Q_ROUTER_HOST',
+  'QINGFU_ROUTER_CONFIG_PATH',
+  'QINGFU_ROUTER_PORT',
+  'QINGFU_ROUTER_HOST',
   'Q_UPSTREAM_BASE_URL',
   'Q_UPSTREAM_API_KEY',
   'Q_UPSTREAM_TIMEOUT_MS',
+  'QINGFU_UPSTREAM_BASE_URL',
+  'QINGFU_UPSTREAM_API_KEY',
+  'QINGFU_UPSTREAM_TIMEOUT_MS',
+  'Q_TRACE_DIR',
+  'Q_TRACE_JSONL_PATH',
+  'Q_TRACE_SQLITE_PATH',
+  'QINGFU_TRACE_DIR',
+  'QINGFU_TRACE_JSONL_PATH',
+  'QINGFU_TRACE_SQLITE_PATH',
+  'CUSTOM_CODEX_ENV',
 ];
 
 afterEach(() => {
@@ -153,6 +166,50 @@ describe('router config file', () => {
     });
   });
 
+  test('supports explicit routes, apiKeyEnv, and legacy QINGFU env aliases without requiring models.allow', () => {
+    const dir = writeRouterConfig({
+      upstream: {
+        baseUrl: 'https://example.test/v1',
+        timeoutMs: 12345,
+      },
+      providers: {
+        codex: {
+          api: 'openai-responses',
+          apiKeyEnv: 'CUSTOM_CODEX_ENV',
+          baseUrl: 'https://codex.example.test/v1',
+          models: [{ id: 'gpt-5.4', name: 'GPT-5.4' }],
+        },
+      },
+      routes: [
+        {
+          id: 'codex-main',
+          provider: 'codex',
+          aliases: ['LR/gpt-5.4', 'gpt-5.4', 'codex/gpt-5.4'],
+          model: 'gpt-5.4',
+        },
+      ],
+    });
+
+    chdir(dir);
+    process.env.CUSTOM_CODEX_ENV = 'codex-secret';
+    process.env.QINGFU_UPSTREAM_TIMEOUT_MS = '54321';
+
+    const runtime = loadRouterRuntimeConfig();
+
+    expect(runtime.upstream.timeoutMs).toBe(54321);
+    expect(runtime.routes).toEqual([
+      {
+        id: 'codex-main',
+        provider: 'codex',
+        aliases: ['LR/gpt-5.4', 'gpt-5.4', 'codex/gpt-5.4'],
+        model: 'gpt-5.4',
+      },
+    ]);
+    expect(runtime.models.allow).toEqual(['LR/gpt-5.4', 'gpt-5.4', 'codex/gpt-5.4']);
+    expect(runtime.providers.codex.apiKey).toBe('codex-secret');
+    expect(runtime.providers.codex.apiKeySource).toBe('env:CUSTOM_CODEX_ENV');
+  });
+
   test('rejects models that are not listed in config/router.json', async () => {
     const dir = writeRouterConfig({
       upstream: {
@@ -270,6 +327,61 @@ describe('router config file', () => {
       traces: {
         dir: '.qingfu-router',
       },
+    });
+
+    await app.close();
+  });
+
+  test('exposes compiled routes and non-blocking warnings through /debug/routes', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        codex: {
+          api: 'openai-responses',
+          apiKey: 'inline-secret',
+          baseUrl: 'https://codex.example.test/v1',
+          models: [{ id: 'gpt-5.4', name: 'GPT-5.4' }],
+        },
+      },
+      routes: [
+        {
+          id: 'codex-main',
+          provider: 'codex',
+          aliases: ['LR/gpt-5.4', 'gpt-5.4'],
+          model: 'gpt-5.4',
+        },
+      ],
+    });
+
+    chdir(dir);
+    const runtime = loadRouterRuntimeConfig();
+    const app = buildApp({
+      routerConfig: runtime,
+      fetchUpstream: async () => {
+        throw new Error('should not be called by /debug/routes');
+      },
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/debug/routes',
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      warnings: expect.arrayContaining([
+        'Provider "codex" uses inline apiKey in config; prefer apiKeyEnv or environment variables.',
+      ]),
+      routes: [
+        expect.objectContaining({
+          id: 'codex-main',
+          providerId: 'codex',
+          providerApi: 'openai-responses',
+          authMode: 'bearer',
+          apiKeySource: 'inline-config',
+          upstreamEndpoint: 'https://codex.example.test/v1/responses',
+          upstreamModel: 'gpt-5.4',
+        }),
+      ],
     });
 
     await app.close();

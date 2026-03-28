@@ -4,7 +4,7 @@
 Design and implement a local OpenAI-compatible gateway for OpenClaw that keeps `gpt-5.4` as the primary path, performs same-provider same-model in-place retries, and integrates through `baseUrl` configuration rather than OpenClaw source patches.
 
 ## Current Phase
-Phase 2
+Phase 8
 
 ## Success Criteria
 - OpenClaw can send model traffic to the local router via config-only changes.
@@ -91,10 +91,19 @@ The router must apply a **semantic success gate** before returning any upstream 
 - **Status:** complete
 
 ### Phase 7: Delivery
-- [ ] Summarize architecture, assumptions, and constraints
-- [ ] Hand over implementation and config instructions
-- [ ] List follow-up enhancements (provider switching, per-agent policies, health scoring, dashboard)
-- **Status:** pending
+- [x] Summarize architecture, assumptions, and constraints
+- [x] Hand over implementation and config instructions
+- [x] List follow-up enhancements (provider switching, per-agent policies, health scoring, dashboard)
+- [x] Add a dedicated routing audit for model/provider/id/url/key/thinklevel mapping
+- **Status:** complete
+
+### Phase 8: Backward-Compatible Structure Improvements
+- [x] Add explicit `routes` support without breaking legacy config
+- [x] Add explicit provider `apiKeyEnv` support
+- [x] Add compatibility handling for legacy `QINGFU_*` env names
+- [x] Add effective route introspection endpoint
+- [x] Verify old behavior stays green through full tests
+- **Status:** complete
 
 ## Architecture Draft
 1. **Ingress Layer**

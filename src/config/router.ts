@@ -23,9 +23,20 @@ export type RouterProviderConfig = {
   baseUrl?: string;
   auth?: string;
   authHeader?: boolean;
+  apiKeyEnv?: string;
   apiKey?: string;
+  apiKeySource?: string;
   headers?: Record<string, string>;
   models?: RouterModelEntry[];
+};
+
+export type RouterRouteConfig = {
+  id?: string;
+  provider: string;
+  aliases?: string[];
+  model?: string;
+  strategy?: 'direct' | 'round-robin';
+  members?: string[];
 };
 
 export type ThinkingRewriteRule = {
@@ -57,6 +68,7 @@ export type RouterFileConfig = {
     timeoutMs?: number;
   };
   providers?: Record<string, RouterProviderConfig>;
+  routes?: RouterRouteConfig[];
   models?: {
     allow?: string[];
   };
@@ -80,6 +92,7 @@ export type RouterRuntimeConfig = {
     timeoutMs: number;
   };
   providers: Record<string, RouterProviderConfig>;
+  routes: RouterRouteConfig[];
   models: {
     allow: string[];
   };
@@ -100,14 +113,67 @@ function parseNumber(value: string | undefined, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function firstDefinedEnv(...names: Array<string | undefined>): { value?: string; source?: string } {
+  for (const name of names) {
+    if (!name) {
+      continue;
+    }
+    if (process.env[name] !== undefined) {
+      return {
+        value: process.env[name],
+        source: name,
+      };
+    }
+  }
+
+  return {};
+}
+
+function uniqueStrings(values: Array<string | undefined>): string[] {
+  const seen = new Set<string>();
+  const items: string[] = [];
+
+  for (const value of values) {
+    if (typeof value !== 'string' || value.length === 0 || seen.has(value)) {
+      continue;
+    }
+    seen.add(value);
+    items.push(value);
+  }
+
+  return items;
+}
+
 function resolveProviderApiKey(
   providerId: string,
   providerConfig: RouterProviderConfig,
-  fallbackUpstreamApiKey?: string,
-): string | undefined {
+  fallbackUpstream: { apiKey?: string; apiKeySource?: string },
+): { apiKey?: string; apiKeySource?: string } {
   const normalizedId = providerId.replace(/[^a-zA-Z0-9]+/g, '_').toUpperCase();
   const envKey = `Q_${normalizedId}_API_KEY`;
-  return process.env[envKey] ?? providerConfig.apiKey ?? (providerId === 'openrouter' ? fallbackUpstreamApiKey : undefined);
+  const envOverride = firstDefinedEnv(providerConfig.apiKeyEnv, envKey);
+  if (envOverride.value !== undefined) {
+    return {
+      apiKey: envOverride.value,
+      apiKeySource: envOverride.source ? `env:${envOverride.source}` : 'env',
+    };
+  }
+
+  if (providerConfig.apiKey !== undefined) {
+    return {
+      apiKey: providerConfig.apiKey,
+      apiKeySource: 'inline-config',
+    };
+  }
+
+  if (providerId === 'openrouter' && fallbackUpstream.apiKey !== undefined) {
+    return {
+      apiKey: fallbackUpstream.apiKey,
+      apiKeySource: fallbackUpstream.apiKeySource ?? 'upstream-fallback',
+    };
+  }
+
+  return {};
 }
 
 function resolveProjectRelativeConfigPath(): string {
@@ -116,7 +182,7 @@ function resolveProjectRelativeConfigPath(): string {
 }
 
 export function resolveRouterConfigPath(): string {
-  const explicit = process.env.Q_ROUTER_CONFIG_PATH;
+  const explicit = firstDefinedEnv('Q_ROUTER_CONFIG_PATH', 'QINGFU_ROUTER_CONFIG_PATH').value;
   if (explicit) {
     return resolve(explicit);
   }
@@ -140,23 +206,36 @@ function readRouterFileConfig(configPath: string): RouterFileConfig {
 export function loadRouterRuntimeConfig(): RouterRuntimeConfig {
   const configPath = resolveRouterConfigPath();
   const fileConfig = readRouterFileConfig(configPath);
+  const configuredRoutes = fileConfig.routes ?? [];
+  const configuredAllow = fileConfig.models?.allow ?? [];
 
-  const serverHost = process.env.Q_ROUTER_HOST ?? fileConfig.server?.host ?? '127.0.0.1';
-  const serverPort = parseNumber(process.env.Q_ROUTER_PORT, fileConfig.server?.port ?? 4318);
-  const upstreamBaseUrl = process.env.Q_UPSTREAM_BASE_URL ?? fileConfig.upstream?.baseUrl;
-  const upstreamApiKey = process.env.Q_UPSTREAM_API_KEY;
+  const serverHost = firstDefinedEnv('Q_ROUTER_HOST', 'QINGFU_ROUTER_HOST').value ?? fileConfig.server?.host ?? '127.0.0.1';
+  const serverPort = parseNumber(
+    firstDefinedEnv('Q_ROUTER_PORT', 'QINGFU_ROUTER_PORT').value,
+    fileConfig.server?.port ?? 4318,
+  );
+  const upstreamBaseUrl = firstDefinedEnv('Q_UPSTREAM_BASE_URL', 'QINGFU_UPSTREAM_BASE_URL').value ?? fileConfig.upstream?.baseUrl;
+  const upstreamApiKeyEnv = firstDefinedEnv('Q_UPSTREAM_API_KEY', 'QINGFU_UPSTREAM_API_KEY');
+  const upstreamApiKey = upstreamApiKeyEnv.value;
   const upstreamTimeoutMs = parseNumber(
-    process.env.Q_UPSTREAM_TIMEOUT_MS,
+    firstDefinedEnv('Q_UPSTREAM_TIMEOUT_MS', 'QINGFU_UPSTREAM_TIMEOUT_MS').value,
     fileConfig.upstream?.timeoutMs ?? 45_000,
   );
 
   const providers = Object.fromEntries(
     Object.entries(fileConfig.providers ?? {}).map(([providerId, providerConfig]) => [
       providerId,
-      {
-        ...providerConfig,
-        apiKey: resolveProviderApiKey(providerId, providerConfig, upstreamApiKey),
-      },
+      (() => {
+        const resolvedApiKey = resolveProviderApiKey(providerId, providerConfig, {
+          apiKey: upstreamApiKey,
+          apiKeySource: upstreamApiKeyEnv.source ? `env:${upstreamApiKeyEnv.source}` : undefined,
+        });
+        return {
+          ...providerConfig,
+          apiKey: resolvedApiKey.apiKey,
+          apiKeySource: resolvedApiKey.apiKeySource,
+        };
+      })(),
     ]),
   );
 
@@ -172,8 +251,12 @@ export function loadRouterRuntimeConfig(): RouterRuntimeConfig {
       timeoutMs: upstreamTimeoutMs,
     },
     providers,
+    routes: configuredRoutes,
     models: {
-      allow: fileConfig.models?.allow ?? [],
+      allow:
+        configuredAllow.length > 0
+          ? configuredAllow
+          : uniqueStrings(configuredRoutes.flatMap((route) => route.aliases ?? [])),
     },
     thinking: {
       defaultMode: fileConfig.thinking?.defaultMode ?? 'pass-through',
@@ -181,9 +264,9 @@ export function loadRouterRuntimeConfig(): RouterRuntimeConfig {
       mappings: fileConfig.thinking?.mappings ?? [],
     },
     traces: {
-      dir: process.env.Q_TRACE_DIR ?? fileConfig.traces?.dir,
-      jsonlPath: process.env.Q_TRACE_JSONL_PATH ?? fileConfig.traces?.jsonlPath,
-      sqlitePath: process.env.Q_TRACE_SQLITE_PATH ?? fileConfig.traces?.sqlitePath,
+      dir: firstDefinedEnv('Q_TRACE_DIR', 'QINGFU_TRACE_DIR').value ?? fileConfig.traces?.dir,
+      jsonlPath: firstDefinedEnv('Q_TRACE_JSONL_PATH', 'QINGFU_TRACE_JSONL_PATH').value ?? fileConfig.traces?.jsonlPath,
+      sqlitePath: firstDefinedEnv('Q_TRACE_SQLITE_PATH', 'QINGFU_TRACE_SQLITE_PATH').value ?? fileConfig.traces?.sqlitePath,
     },
   };
 }

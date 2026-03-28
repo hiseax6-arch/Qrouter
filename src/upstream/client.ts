@@ -4,6 +4,8 @@ import {
   toChatCompletionUsage,
   type TokenUsage,
 } from '../domain/token-usage.js';
+import type { CompiledRoute } from '../routing/routes.js';
+import { resolveDirectRoute } from '../routing/routes.js';
 
 type ThinkingTrace = {
   inboundThinking?: string;
@@ -51,6 +53,7 @@ export type UpstreamResponse = {
   usage?(): Promise<TokenUsage | null>;
   bodyText?(): Promise<string>;
   providerId?: string;
+  routeId?: string;
   upstreamUrl?: string;
   thinkingTrace?: ThinkingTrace;
 };
@@ -70,6 +73,7 @@ type ProviderSelection = {
   provider: RouterProviderConfig;
   requestModel: string;
   upstreamModel: string;
+  routeId?: string;
 };
 
 type FallbackUpstreamConfig = {
@@ -1030,13 +1034,26 @@ export function createProviderAwareFetch(
   providers: Record<string, RouterProviderConfig>,
   fallback: FallbackUpstreamConfig,
   thinkingConfig?: RouterThinkingConfig,
+  routes?: CompiledRoute[],
 ): FetchUpstream {
   const fallbackFetch = fallback.baseUrl
     ? createFetchUpstream(fallback.baseUrl, fallback.apiKey, fallback.timeoutMs)
     : null;
 
   return async (args) => {
-    const selection = resolveProviderSelection((args.body as Record<string, unknown>)?.model, providers);
+    const requestedModel = (args.body as Record<string, unknown>)?.model;
+    const directRoute = routes ? resolveDirectRoute(requestedModel, routes) : null;
+    const directRouteProvider = directRoute ? providers[directRoute.providerId] : undefined;
+    const selection =
+      directRoute && directRouteProvider
+        ? {
+            providerId: directRoute.providerId,
+            provider: directRouteProvider,
+            requestModel: typeof requestedModel === 'string' ? requestedModel : String(directRoute.upstreamModel),
+            upstreamModel: directRoute.upstreamModel,
+            routeId: directRoute.route.id,
+          }
+        : resolveProviderSelection(requestedModel, providers);
     if (!selection) {
       if (fallbackFetch) {
         return fallbackFetch(args);
@@ -1060,6 +1077,7 @@ export function createProviderAwareFetch(
       return {
         ...upstream,
         providerId: selection.providerId,
+        routeId: selection.routeId,
         thinkingTrace: finalThinkingTrace,
       };
     }
@@ -1071,6 +1089,7 @@ export function createProviderAwareFetch(
     return {
       ...upstream,
       providerId: selection.providerId,
+      routeId: selection.routeId,
       thinkingTrace: finalThinkingTrace,
     };
   };
@@ -1080,6 +1099,7 @@ export function createProviderAwareResponsesPassthrough(
   providers: Record<string, RouterProviderConfig>,
   fallback: FallbackUpstreamConfig,
   thinkingConfig?: RouterThinkingConfig,
+  routes?: CompiledRoute[],
 ): FetchUpstream {
   const fallbackFetch = fallback.baseUrl
     ? createOpenAIResponsesPassthroughFetch(
@@ -1093,7 +1113,19 @@ export function createProviderAwareResponsesPassthrough(
     : null;
 
   return async (args) => {
-    const selection = resolveProviderSelection((args.body as Record<string, unknown>)?.model, providers);
+    const requestedModel = (args.body as Record<string, unknown>)?.model;
+    const directRoute = routes ? resolveDirectRoute(requestedModel, routes) : null;
+    const directRouteProvider = directRoute ? providers[directRoute.providerId] : undefined;
+    const selection =
+      directRoute && directRouteProvider
+        ? {
+            providerId: directRoute.providerId,
+            provider: directRouteProvider,
+            requestModel: typeof requestedModel === 'string' ? requestedModel : String(directRoute.upstreamModel),
+            upstreamModel: directRoute.upstreamModel,
+            routeId: directRoute.route.id,
+          }
+        : resolveProviderSelection(requestedModel, providers);
     if (!selection) {
       if (fallbackFetch) {
         return fallbackFetch(args);
@@ -1120,6 +1152,7 @@ export function createProviderAwareResponsesPassthrough(
     return {
       ...upstream,
       providerId: selection.providerId,
+      routeId: selection.routeId,
       thinkingTrace: finalThinkingTrace,
     };
   };

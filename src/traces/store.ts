@@ -225,10 +225,10 @@ function initializeSchema(db: SqliteDatabase): void {
 }
 
 export function resolveTracePaths(overrides: TracePathOverrides = {}): TracePaths {
-  const baseDir = overrides.dir ?? process.env.Q_TRACE_DIR ?? join(process.cwd(), '.Q-router');
+  const baseDir = overrides.dir ?? process.env.Q_TRACE_DIR ?? process.env.QINGFU_TRACE_DIR ?? join(process.cwd(), '.Q-router');
   return {
-    jsonlPath: overrides.jsonlPath ?? process.env.Q_TRACE_JSONL_PATH ?? join(baseDir, 'events.jsonl'),
-    sqlitePath: overrides.sqlitePath ?? process.env.Q_TRACE_SQLITE_PATH ?? join(baseDir, 'summaries.sqlite'),
+    jsonlPath: overrides.jsonlPath ?? process.env.Q_TRACE_JSONL_PATH ?? process.env.QINGFU_TRACE_JSONL_PATH ?? join(baseDir, 'events.jsonl'),
+    sqlitePath: overrides.sqlitePath ?? process.env.Q_TRACE_SQLITE_PATH ?? process.env.QINGFU_TRACE_SQLITE_PATH ?? join(baseDir, 'summaries.sqlite'),
   };
 }
 

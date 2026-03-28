@@ -5,6 +5,7 @@ import {
   buildAllowedModelCandidates,
   resolveRequestedModelAlias,
 } from './model-normalization.js';
+import type { CompiledRoute } from '../routing/routes.js';
 import { nowTraceTimestamp, type TraceStore } from '../traces/store.js';
 import type { FetchUpstream } from '../upstream/client.js';
 
@@ -12,6 +13,7 @@ export type ResponsesDeps = {
   fetchUpstream: FetchUpstream;
   traceStore: TraceStore;
   allowedModels?: Set<string>;
+  routes?: CompiledRoute[];
 };
 
 type ResponsesRequestBody = {
@@ -117,6 +119,7 @@ export function createResponsesHandler(deps: ResponsesDeps) {
         stream,
         status: upstream.status,
         ...(upstream.providerId ? { providerId: upstream.providerId } : {}),
+        ...(upstream.routeId ? { routeId: upstream.routeId } : {}),
         ...(upstream.upstreamUrl ? { upstreamUrl: upstream.upstreamUrl } : {}),
         ...(upstream.thinkingTrace ?? {}),
       }),

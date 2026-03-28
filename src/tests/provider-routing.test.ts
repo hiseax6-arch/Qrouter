@@ -1095,23 +1095,19 @@ describe('provider-aware upstream routing', () => {
     process.env.Q_CODEX_API_KEY = 'codex-secret';
 
     vi.stubGlobal('fetch', vi.fn(async () => {
+      const sse = [
+        'data: {"type":"response.created","response":{"id":"resp-codex-tool-call-stream"}}',
+        'data: {"type":"response.output_item.added","item":{"id":"fc_456","type":"function_call","status":"in_progress","arguments":"","call_id":"call_456","name":"implement_json_alignment"},"output_index":0}',
+        'data: {"type":"response.function_call_arguments.done","arguments":"{\\"mode\\":\\"apply\\"}","item_id":"fc_456","output_index":0}',
+        'data: {"type":"response.completed","response":{"id":"resp-codex-tool-call-stream"}}',
+        'data: [DONE]',
+      ].join('\n\n');
       return new Response(
-        JSON.stringify({
-          id: 'resp-codex-tool-call-stream',
-          output: [
-            {
-              type: 'function_call',
-              id: 'fc_456',
-              call_id: 'call_456',
-              name: 'implement_json_alignment',
-              arguments: '{"mode":"apply"}',
-            },
-          ],
-        }),
+        `${sse}\n\n`,
         {
           status: 200,
           headers: {
-            'content-type': 'application/json',
+            'content-type': 'text/event-stream; charset=utf-8',
           },
         },
       );
@@ -1135,8 +1131,9 @@ describe('provider-aware upstream routing', () => {
     expect(response.headers['content-type']).toContain('text/event-stream');
     expect(response.body).toContain('resp-codex-tool-call-stream');
     expect(response.body).toContain('tool_calls');
+    expect(response.body).toContain('call_456');
     expect(response.body).toContain('implement_json_alignment');
-    expect(response.body).toContain('tool_calls');
+    expect(response.body).not.toContain('fc_456');
     expect(response.body).toContain('[DONE]');
 
     await app.close();

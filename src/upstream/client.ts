@@ -684,10 +684,63 @@ async function* adaptResponsesSseToChatCompletionsStream(
   let responseId = 'resp-adapted';
   let emittedToolCall = false;
   const functionCalls = new Map<string, ResponsesFunctionCallState>();
+  const functionCallAliases = new Map<string, string>();
+
+  const resolveFunctionCallKey = (key: string) => {
+    let current = key;
+    const seen = new Set<string>();
+    while (current && functionCallAliases.has(current) && !seen.has(current)) {
+      seen.add(current);
+      current = functionCallAliases.get(current) ?? current;
+    }
+    return current;
+  };
+
+  const mergeFunctionCallStates = (
+    primary: ResponsesFunctionCallState,
+    secondary: ResponsesFunctionCallState,
+  ): ResponsesFunctionCallState => ({
+    id: primary.id || secondary.id,
+    name: primary.name || secondary.name,
+    arguments: primary.arguments || secondary.arguments,
+    outputIndex: primary.outputIndex ?? secondary.outputIndex,
+  });
+
+  const linkFunctionCallAlias = (alias: string, canonicalKey: string) => {
+    if (!alias || !canonicalKey) {
+      return;
+    }
+
+    const resolvedAlias = resolveFunctionCallKey(alias);
+    const resolvedCanonical = resolveFunctionCallKey(canonicalKey);
+
+    if (resolvedAlias === resolvedCanonical) {
+      if (alias !== resolvedCanonical) {
+        functionCallAliases.set(alias, resolvedCanonical);
+      }
+      return;
+    }
+
+    const aliasState = functionCalls.get(resolvedAlias);
+    const canonicalState = functionCalls.get(resolvedCanonical);
+    if (aliasState) {
+      functionCalls.set(
+        resolvedCanonical,
+        canonicalState ? mergeFunctionCallStates(canonicalState, aliasState) : aliasState,
+      );
+      functionCalls.delete(resolvedAlias);
+    }
+
+    functionCallAliases.set(alias, resolvedCanonical);
+    if (resolvedAlias !== alias) {
+      functionCallAliases.set(resolvedAlias, resolvedCanonical);
+    }
+  };
 
   const ensureFunctionCall = (key: string, seed?: Partial<ResponsesFunctionCallState>) => {
-    const current = functionCalls.get(key) ?? {
-      id: key,
+    const resolvedKey = resolveFunctionCallKey(key);
+    const current = functionCalls.get(resolvedKey) ?? {
+      id: resolvedKey,
       name: '',
       arguments: '',
       outputIndex: 0,
@@ -696,7 +749,10 @@ async function* adaptResponsesSseToChatCompletionsStream(
       ...current,
       ...(seed ?? {}),
     };
-    functionCalls.set(key, next);
+    functionCalls.set(resolvedKey, next);
+    if (resolvedKey !== key) {
+      functionCallAliases.set(key, resolvedKey);
+    }
     return next;
   };
 
@@ -759,31 +815,53 @@ async function* adaptResponsesSseToChatCompletionsStream(
           ? parsed.item as Record<string, unknown>
           : null;
         if (item?.type === 'function_call') {
-          const key = typeof item.call_id === 'string'
+          const itemId = typeof item.id === 'string'
+            ? item.id
+            : typeof parsed.item_id === 'string'
+              ? parsed.item_id
+              : '';
+          const callId = typeof item.call_id === 'string'
             ? item.call_id
-            : typeof item.id === 'string'
-              ? item.id
-              : typeof parsed.item_id === 'string'
-                ? parsed.item_id
-                : '';
+            : '';
+          const key = itemId || callId;
+          if (callId && itemId) {
+            linkFunctionCallAlias(callId, itemId);
+          }
           if (key) {
             ensureFunctionCall(key, {
-              id: typeof item.call_id === 'string' ? item.call_id : key,
+              id: callId || key,
               name: typeof item.name === 'string' ? item.name : '',
               arguments: typeof item.arguments === 'string' ? item.arguments : '',
               outputIndex: typeof parsed.output_index === 'number' ? parsed.output_index : 0,
             });
+          } else {
+            const fallbackKey = typeof item.call_id === 'string'
+              ? item.call_id
+              : typeof item.id === 'string'
+                ? item.id
+                : typeof parsed.item_id === 'string'
+                  ? parsed.item_id
+                  : '';
+            if (fallbackKey) {
+              ensureFunctionCall(fallbackKey, {
+                id: typeof item.call_id === 'string' ? item.call_id : fallbackKey,
+                name: typeof item.name === 'string' ? item.name : '',
+                arguments: typeof item.arguments === 'string' ? item.arguments : '',
+                outputIndex: typeof parsed.output_index === 'number' ? parsed.output_index : 0,
+              });
+            }
           }
         }
         continue;
       }
 
       if (eventType === 'response.function_call_arguments.delta') {
-        const key = typeof parsed.item_id === 'string'
-          ? parsed.item_id
-          : typeof parsed.call_id === 'string'
-            ? parsed.call_id
-            : '';
+        const itemId = typeof parsed.item_id === 'string' ? parsed.item_id : '';
+        const callId = typeof parsed.call_id === 'string' ? parsed.call_id : '';
+        if (callId && itemId) {
+          linkFunctionCallAlias(callId, itemId);
+        }
+        const key = resolveFunctionCallKey(itemId || callId);
         if (!key) {
           continue;
         }
@@ -792,17 +870,18 @@ async function* adaptResponsesSseToChatCompletionsStream(
         });
         if (typeof parsed.delta === 'string') {
           current.arguments += parsed.delta;
-          functionCalls.set(key, current);
+          functionCalls.set(resolveFunctionCallKey(key), current);
         }
         continue;
       }
 
       if (eventType === 'response.function_call_arguments.done') {
-        const key = typeof parsed.item_id === 'string'
-          ? parsed.item_id
-          : typeof parsed.call_id === 'string'
-            ? parsed.call_id
-            : '';
+        const itemId = typeof parsed.item_id === 'string' ? parsed.item_id : '';
+        const callId = typeof parsed.call_id === 'string' ? parsed.call_id : '';
+        if (callId && itemId) {
+          linkFunctionCallAlias(callId, itemId);
+        }
+        const key = resolveFunctionCallKey(itemId || callId);
         if (!key) {
           continue;
         }
@@ -811,7 +890,7 @@ async function* adaptResponsesSseToChatCompletionsStream(
         });
         if (typeof parsed.arguments === 'string') {
           current.arguments = parsed.arguments;
-          functionCalls.set(key, current);
+          functionCalls.set(resolveFunctionCallKey(key), current);
         }
         emittedToolCall = true;
         yield `data: ${JSON.stringify({

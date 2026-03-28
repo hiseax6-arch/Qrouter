@@ -17,8 +17,20 @@ import {
   buildStreamErrorEvent,
   buildTerminalFailure,
 } from '../errors/terminal-payload.js';
+import {
+  buildAllowedModelCandidates,
+  resolveRequestedModelAlias,
+} from './model-normalization.js';
 import { nowTraceTimestamp, type TraceStore } from '../traces/store.js';
 import type { FetchUpstream, UpstreamResponse } from '../upstream/client.js';
+
+let msRoundRobinIndex = 0;
+const MODELSCOPE_MODEL_POOL = [
+  'MiniMax/MiniMax-M2.5',
+  'ZhipuAI/GLM-5',
+  'Qwen/Qwen3-235B-A22B',
+  'moonshotai/Kimi-K2.5',
+] as const;
 
 export type RetryPolicy = {
   maxAttempts: number;
@@ -180,14 +192,6 @@ function classifyThrownUpstreamError(error: unknown): 'timeout' | 'connection_er
 
 function isStreamingRequest(body: ChatCompletionsRequestBody): boolean {
   return body.stream === true;
-}
-
-function normalizeAllowedModel(model: string | null): string | null {
-  if (!model) {
-    return model;
-  }
-
-  return model.startsWith('LR/') ? model.slice(3) : model;
 }
 
 function buildTraceEvent(requestId: string, event: string, data: Record<string, unknown>) {
@@ -373,12 +377,52 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
   ) {
     const requestId = randomUUID();
     const body = (request.body ?? {}) as ChatCompletionsRequestBody;
-    const model = body.model ?? null;
+    const rawRequestedModel = body.model ?? null;
+    const requestedModel = resolveRequestedModelAlias(rawRequestedModel, deps.allowedModels);
+    if (requestedModel && requestedModel !== rawRequestedModel) {
+      body.model = requestedModel;
+    }
+    let model = requestedModel;
+    let modelScopePoolIndex: number | null = null;
+
+    // Handle LR/ms round-robin selection
+    if (requestedModel === 'LR/ms') {
+      modelScopePoolIndex = msRoundRobinIndex % MODELSCOPE_MODEL_POOL.length;
+      const chosen = MODELSCOPE_MODEL_POOL[modelScopePoolIndex];
+      msRoundRobinIndex++;
+      body.model = chosen;
+      model = chosen;
+    }
+
     const stream = isStreamingRequest(body);
+
+    function advanceModelScopeFallback(nextAttempt: number, reason: string) {
+      if (requestedModel !== 'LR/ms' || modelScopePoolIndex === null || MODELSCOPE_MODEL_POOL.length < 2) {
+        return;
+      }
+
+      const previousModel = model;
+      modelScopePoolIndex = (modelScopePoolIndex + 1) % MODELSCOPE_MODEL_POOL.length;
+      model = MODELSCOPE_MODEL_POOL[modelScopePoolIndex];
+      body.model = model;
+
+      deps.traceStore.appendEvent(
+        buildTraceEvent(requestId, 'alias_model_rotated', {
+          attempt: nextAttempt,
+          requestedModel,
+          previousModel,
+          model,
+          stream,
+          classification: reason,
+        }),
+      );
+    }
 
     deps.traceStore.appendEvent(
       buildTraceEvent(requestId, 'request_received', {
         model,
+        ...(rawRequestedModel && rawRequestedModel !== requestedModel ? { rawRequestedModel } : {}),
+        ...(requestedModel && requestedModel !== model ? { requestedModel } : {}),
         stream,
         ...(typeof (body as Record<string, unknown>).thinking === 'string' ? { thinking: (body as Record<string, unknown>).thinking } : {}),
         ...(typeof (body as Record<string, unknown>).reasoning_effort === 'string' ? { reasoning_effort: (body as Record<string, unknown>).reasoning_effort } : {}),
@@ -388,17 +432,21 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
       }),
     );
 
-    const allowedModel = normalizeAllowedModel(model);
+    const allowedModelsToCheck = buildAllowedModelCandidates(
+      model,
+      requestedModel,
+      rawRequestedModel,
+    );
     if (
-      allowedModel &&
       deps.allowedModels &&
       deps.allowedModels.size > 0 &&
-      !deps.allowedModels.has(model as string) &&
-      !deps.allowedModels.has(allowedModel)
+      !allowedModelsToCheck.some((candidate) => deps.allowedModels?.has(candidate))
     ) {
       deps.traceStore.appendEvent(
         buildTraceEvent(requestId, 'request_rejected', {
           model,
+          ...(rawRequestedModel && rawRequestedModel !== requestedModel ? { rawRequestedModel } : {}),
+          ...(requestedModel && requestedModel !== model ? { requestedModel } : {}),
           stream,
           classification: 'model_not_allowed',
         }),
@@ -622,6 +670,7 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
           }
 
           if (attempt < deps.retryPolicy.maxAttempts) {
+            advanceModelScopeFallback(attempt + 1, finalClassification);
             await sleep(deps.retryPolicy.backoffMs(attempt, finalClassification));
             continue;
           }
@@ -649,6 +698,7 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
           );
 
           if (attempt < deps.retryPolicy.maxAttempts) {
+            advanceModelScopeFallback(attempt + 1, finalClassification);
             await sleep(deps.retryPolicy.backoffMs(attempt, finalClassification));
             continue;
           }
@@ -692,6 +742,7 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
         );
 
         if (attempt < deps.retryPolicy.maxAttempts) {
+          advanceModelScopeFallback(attempt + 1, finalClassification);
           await sleep(deps.retryPolicy.backoffMs(attempt, finalClassification));
           continue;
         }

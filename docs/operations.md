@@ -40,6 +40,7 @@ A healthy request should produce:
 A suspicious request includes any of:
 - repeated `empty_success`,
 - repeated timeouts on same model,
+- repeated `alias_model_rotated` events for `LR/ms`,
 - post-commit upstream failures,
 - no traces for a request that should have passed through router.
 
@@ -104,6 +105,8 @@ Returned dimensions:
 - promptTokens
 - completionTokens
 - totalTokens
+
+For `LR/ms`, token usage is attributed to the concrete ModelScope backend selected for that request attempt.
 
 ## Failure Classes to Expect
 - `empty_success`
@@ -181,6 +184,8 @@ Returned dimensions:
 - stream closes before commit and gets retried,
 - stream with real content commits once,
 - exhausted empty-success returns explicit failure,
+- `LR/ms` rotates across the configured ModelScope backends,
+- retryable `LR/ms` failures rotate to the next ModelScope backend before exhausting,
 - apply/rollback config preview matches the intended diff,
 - rollback path works cleanly.
 

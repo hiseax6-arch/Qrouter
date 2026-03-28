@@ -4,7 +4,7 @@
 Qingfu Router is a local OpenAI-compatible gateway inserted in front of the real upstream model provider used by OpenClaw. Its v1 purpose is narrow and deliberate:
 
 - preserve the requested model identity (notably `gpt-5.4`),
-- retry on the **same provider + same model**, and
+- retry on the **same provider + same model**, except when the request uses the rotating `LR/ms` alias, and
 - prevent **empty-success / pseudo-success** from being returned to OpenClaw as a normal completion.
 
 ## Problem Statement
@@ -20,7 +20,7 @@ The router exists to break that chain at the boundary before OpenClaw accepts th
 
 ## Design Principles
 - **Semantic success before transport success**: HTTP 2xx or normal stream termination is not enough.
-- **Same-path retries only**: v1 does not auto-switch provider or model.
+- **Same-path retries only**: v1 does not auto-switch provider or model, except for the internal `LR/ms` alias which may advance within its configured ModelScope pool before commit.
 - **No OpenClaw core patches**: integration happens through provider `baseUrl`.
 - **Transparent retry only before commit**: once meaningful output is sent downstream, no silent retry.
 - **Durable forensics**: intermittent empty-reply bugs require traceable evidence.
@@ -49,7 +49,7 @@ Responsibilities:
 Applies v1 rules.
 
 Responsibilities:
-- same-provider same-model retry only,
+- same-provider same-model retry only, with `LR/ms` treated as one logical alias that can rotate across its configured pool,
 - attempt budget,
 - deadline budget,
 - retryability classification,
@@ -138,7 +138,7 @@ If the upstream appears to succeed but none of those are present, the result is 
 
 ### Default budget
 - max attempts: 3 total,
-- same provider, same model every time,
+- same provider, same model every time unless `LR/ms` is advancing within its own ModelScope pool,
 - total deadline budget still applies.
 
 ## Streaming Commit Strategy

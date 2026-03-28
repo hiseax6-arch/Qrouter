@@ -15,9 +15,17 @@ const envKeys = [
   'Q_UPSTREAM_API_KEY',
   'Q_UPSTREAM_TIMEOUT_MS',
   'Q_CODEX_API_KEY',
+  'Q_CUSTOM_API_KEY',
   'Q_OPENROUTER_API_KEY',
+  'Q_MODELSCOPE_API_KEY',
 ];
 const originalFetch = globalThis.fetch;
+const modelScopePool = [
+  'MiniMax/MiniMax-M2.5',
+  'ZhipuAI/GLM-5',
+  'Qwen/Qwen3-235B-A22B',
+  'moonshotai/Kimi-K2.5',
+] as const;
 
 function writeRouterConfig(config: unknown): string {
   const dir = mkdtempSync(join(tmpdir(), 'Q-router-provider-'));
@@ -1329,6 +1337,72 @@ describe('provider-aware upstream routing', () => {
     await app.close();
   });
 
+  test('accepts bare model ids on /v1/responses when only the LR-prefixed allow entry exists', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        codex: {
+          api: 'openai-responses',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://codex.example.test/v1',
+          models: [
+            {
+              id: 'gpt-5.4',
+              name: 'GPT-5.4',
+            },
+          ],
+        },
+      },
+      models: {
+        allow: ['LR/gpt-5.4'],
+      },
+    });
+
+    chdir(dir);
+    process.env.Q_CODEX_API_KEY = 'codex-secret';
+
+    const fetchSpy = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'resp-passthrough-bare',
+          object: 'response',
+          output: [],
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'gpt-5.4',
+        input: 'hi',
+        stream: false,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const [, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      model: 'gpt-5.4',
+      input: 'hi',
+      stream: false,
+    });
+
+    await app.close();
+  });
+
 
   test('adapts raw responses SSE into chat-completions chunks for streaming requests', async () => {
     const dir = writeRouterConfig({
@@ -1550,6 +1624,260 @@ describe('provider-aware upstream routing', () => {
       'x-api-key': 'custom-secret',
     });
     expect((init.headers as Record<string, string>).authorization).toBeUndefined();
+
+    await app.close();
+  });
+
+  test('routes repeated LR/ms requests through modelscope in round-robin order', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        modelscope: {
+          api: 'openai-completions',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://modelscope.example.test/v1',
+          models: modelScopePool.map((id) => ({
+            id,
+            name: id,
+          })),
+        },
+      },
+      models: {
+        allow: ['LR/ms'],
+      },
+    });
+
+    chdir(dir);
+    process.env.Q_MODELSCOPE_API_KEY = 'ms-secret';
+
+    const fetchSpy = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'resp-modelscope-round-robin',
+          choices: [
+            {
+              message: {
+                role: 'assistant',
+                content: 'ok',
+              },
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+    });
+
+    for (let index = 0; index < modelScopePool.length; index += 1) {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        payload: {
+          model: 'LR/ms',
+          messages: [{ role: 'user', content: `hi ${index}` }],
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+    }
+
+    expect(fetchSpy).toHaveBeenCalledTimes(modelScopePool.length);
+
+    const routedModels = fetchSpy.mock.calls.map((call) => {
+      const [, init] = call as unknown as [string, RequestInit];
+      return JSON.parse(String(init.body)).model as string;
+    });
+    const firstIndex = modelScopePool.indexOf(routedModels[0] as (typeof modelScopePool)[number]);
+    expect(firstIndex).toBeGreaterThanOrEqual(0);
+    expect(routedModels).toEqual(
+      modelScopePool.map((_, offset) => modelScopePool[(firstIndex + offset) % modelScopePool.length]),
+    );
+
+    const [firstUrl, firstInit] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
+    expect(firstUrl).toBe('https://modelscope.example.test/v1/chat/completions');
+    expect(firstInit.headers).toMatchObject({
+      authorization: 'Bearer ms-secret',
+    });
+
+    await app.close();
+  });
+
+  test('accepts bare ms by canonicalizing it to LR/ms before routing', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        modelscope: {
+          api: 'openai-completions',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://modelscope.example.test/v1',
+          models: modelScopePool.map((id) => ({
+            id,
+            name: id,
+          })),
+        },
+      },
+      models: {
+        allow: ['LR/ms'],
+      },
+    });
+
+    chdir(dir);
+    process.env.Q_MODELSCOPE_API_KEY = 'ms-secret';
+
+    const fetchSpy = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'resp-modelscope-bare-ms',
+          choices: [
+            {
+              message: {
+                role: 'assistant',
+                content: 'ok',
+              },
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'ms',
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const [url, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('https://modelscope.example.test/v1/chat/completions');
+    expect(JSON.parse(String(init.body)).model).toBe(modelScopePool[0]);
+
+    await app.close();
+  });
+
+  test('retries LR/ms quota failures by rotating to the next modelscope backend', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        modelscope: {
+          api: 'openai-completions',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://modelscope.example.test/v1',
+          models: modelScopePool.map((id) => ({
+            id,
+            name: id,
+          })),
+        },
+      },
+      models: {
+        allow: ['LR/ms'],
+      },
+    });
+
+    chdir(dir);
+    process.env.Q_MODELSCOPE_API_KEY = 'ms-secret';
+
+    const fetchSpy = vi.fn(async () => {
+      if (fetchSpy.mock.calls.length === 1) {
+        return new Response(
+          JSON.stringify({
+            error: {
+              type: 'usage_limit_reached',
+              message: 'The usage limit has been reached',
+            },
+          }),
+          {
+            status: 403,
+            headers: {
+              'content-type': 'application/json',
+            },
+          },
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          id: 'resp-modelscope-recovered',
+          choices: [
+            {
+              message: {
+                role: 'assistant',
+                content: 'recovered via next modelscope backend',
+              },
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+      retryPolicy: {
+        maxAttempts: 2,
+        backoffMs: () => 0,
+      },
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'LR/ms',
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      id: 'resp-modelscope-recovered',
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: 'recovered via next modelscope backend',
+          },
+        },
+      ],
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+
+    const routedModels = fetchSpy.mock.calls.map((call) => {
+      const [, init] = call as unknown as [string, RequestInit];
+      return JSON.parse(String(init.body)).model as string;
+    });
+    const firstIndex = modelScopePool.indexOf(routedModels[0] as (typeof modelScopePool)[number]);
+    expect(firstIndex).toBeGreaterThanOrEqual(0);
+    expect(routedModels[1]).toBe(modelScopePool[(firstIndex + 1) % modelScopePool.length]);
 
     await app.close();
   });

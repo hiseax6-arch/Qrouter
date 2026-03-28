@@ -1,6 +1,10 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { randomUUID } from 'node:crypto';
 import { PassThrough } from 'node:stream';
+import {
+  buildAllowedModelCandidates,
+  resolveRequestedModelAlias,
+} from './model-normalization.js';
 import { nowTraceTimestamp, type TraceStore } from '../traces/store.js';
 import type { FetchUpstream } from '../upstream/client.js';
 
@@ -17,14 +21,6 @@ type ResponsesRequestBody = {
 
 function isStreamingRequest(body: ResponsesRequestBody): boolean {
   return body.stream === true;
-}
-
-function normalizeAllowedModel(model: string | null): string | null {
-  if (!model) {
-    return model;
-  }
-
-  return model.startsWith('LR/') ? model.slice(3) : model;
 }
 
 function buildTraceEvent(requestId: string, event: string, data: Record<string, unknown>) {
@@ -70,29 +66,32 @@ export function createResponsesHandler(deps: ResponsesDeps) {
   ) {
     const requestId = randomUUID();
     const body = (request.body ?? {}) as ResponsesRequestBody;
-    const model = body.model ?? null;
+    const rawRequestedModel = body.model ?? null;
+    const model = resolveRequestedModelAlias(rawRequestedModel, deps.allowedModels);
+    if (model && model !== rawRequestedModel) {
+      body.model = model;
+    }
     const stream = isStreamingRequest(body);
 
     deps.traceStore.appendEvent(
       buildTraceEvent(requestId, 'responses_request_received', {
         model,
+        ...(rawRequestedModel && rawRequestedModel !== model ? { rawRequestedModel } : {}),
         stream,
         ...(typeof (body as Record<string, unknown>).thinking === 'string' ? { thinking: (body as Record<string, unknown>).thinking } : {}),
         ...(typeof (body as Record<string, unknown>).reasoning_effort === 'string' ? { reasoning_effort: (body as Record<string, unknown>).reasoning_effort } : {}),
       }),
     );
 
-    const allowedModel = normalizeAllowedModel(model);
     if (
-      allowedModel &&
       deps.allowedModels &&
       deps.allowedModels.size > 0 &&
-      !deps.allowedModels.has(model as string) &&
-      !deps.allowedModels.has(allowedModel)
+      !buildAllowedModelCandidates(model, rawRequestedModel).some((candidate) => deps.allowedModels?.has(candidate))
     ) {
       deps.traceStore.appendEvent(
         buildTraceEvent(requestId, 'responses_request_rejected', {
           model,
+          ...(rawRequestedModel && rawRequestedModel !== model ? { rawRequestedModel } : {}),
           stream,
           classification: 'model_not_allowed',
         }),

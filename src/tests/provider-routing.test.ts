@@ -2116,6 +2116,85 @@ describe('provider-aware upstream routing', () => {
     await app.close();
   });
 
+  test('surfaces provider-facing rate-limit error on /v1/responses 429', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        codex: {
+          api: 'openai-responses',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://codex.example.test/v1',
+          models: [
+            {
+              id: 'gpt-5.4',
+              name: 'GPT-5.4',
+            },
+          ],
+        },
+      },
+      models: {
+        allow: ['LR/gpt-5.4', 'gpt-5.4'],
+      },
+    });
+
+    chdir(dir);
+    process.env.Q_CODEX_API_KEY = 'codex-secret';
+
+    const fetchSpy = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          error: {
+            type: 'rate_limit_error',
+            code: 'USAGE_LIMIT_EXCEEDED',
+            message: 'daily usage limit exceeded',
+          },
+        }),
+        {
+          status: 429,
+          headers: {
+            'content-type': 'application/json',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'LR/gpt-5.4',
+        input: 'hi',
+        stream: false,
+      },
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(response.json()).toEqual({
+      error: {
+        message: '上游服务商限流或额度耗尽（429）：daily usage limit exceeded',
+        type: 'provider_rate_limited',
+        request_id: expect.any(String),
+        attempts: 1,
+        final_error_class: 'http_429',
+        upstream_status: 429,
+        upstream_error: {
+          type: 'rate_limit_error',
+          code: 'USAGE_LIMIT_EXCEEDED',
+          message: 'daily usage limit exceeded',
+          body_snippet: expect.stringContaining('USAGE_LIMIT_EXCEEDED'),
+        },
+      },
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    await app.close();
+  });
+
   test('rejects oversized responses requests locally before upstream fetch', async () => {
     const dir = writeRouterConfig({
       providers: {

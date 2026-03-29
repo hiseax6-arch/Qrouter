@@ -2,6 +2,11 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import { randomUUID } from 'node:crypto';
 import { PassThrough } from 'node:stream';
 import {
+  buildRetryExhaustedFailure,
+  buildTerminalFailure,
+  parseUpstreamErrorDetails,
+} from '../errors/terminal-payload.js';
+import {
   buildAllowedModelCandidates,
   resolveRequestedModelAlias,
 } from './model-normalization.js';
@@ -23,6 +28,13 @@ type ResponsesRequestBody = {
   stream?: boolean;
 };
 
+type UpstreamErrorDetails = {
+  type?: string;
+  code?: string;
+  message?: string;
+  bodySnippet?: string;
+};
+
 function isStreamingRequest(body: ResponsesRequestBody): boolean {
   return body.stream === true;
 }
@@ -36,31 +48,48 @@ function buildTraceEvent(requestId: string, event: string, data: Record<string, 
   };
 }
 
-async function readUpstreamErrorPayload(upstream: Awaited<ReturnType<FetchUpstream>>): Promise<unknown> {
-  try {
-    return await upstream.json();
-  } catch {
-    if (upstream.bodyText) {
-      try {
-        const bodyText = await upstream.bodyText();
-        return {
-          error: {
-            message: bodyText || 'Upstream returned a non-JSON error body.',
-            type: 'upstream_error',
-          },
-        };
-      } catch {
-        // ignore
-      }
-    }
-
-    return {
-      error: {
-        message: 'Upstream request failed.',
-        type: 'upstream_error',
-      },
-    };
+async function resolveUpstreamErrorDetails(
+  upstream: Awaited<ReturnType<FetchUpstream>>,
+): Promise<UpstreamErrorDetails | null> {
+  if (!upstream.bodyText) {
+    return null;
   }
+
+  try {
+    return parseUpstreamErrorDetails(await upstream.bodyText());
+  } catch {
+    return null;
+  }
+}
+
+function shouldRetryStatus(status: number, errorDetails: UpstreamErrorDetails | null): boolean {
+  if (status === 429 || status >= 500) {
+    return true;
+  }
+
+  if (status !== 403 || !errorDetails) {
+    return false;
+  }
+
+  const retrySignals = [
+    errorDetails.type,
+    errorDetails.code,
+    errorDetails.message,
+    errorDetails.bodySnippet,
+  ]
+    .filter((value): value is string => typeof value === 'string' && value.length > 0)
+    .map((value) => value.toLowerCase());
+
+  return retrySignals.some((value) =>
+    value.includes('usage_limit_reached') ||
+    value.includes('usage limit has been reached') ||
+    value.includes('rate_limit') ||
+    value.includes('rate limit') ||
+    value.includes('temporarily unavailable') ||
+    value.includes('temporarily_unavailable') ||
+    value.includes('auth_unavailable') ||
+    value.includes('quota'),
+  );
 }
 
 export function createResponsesHandler(deps: ResponsesDeps) {
@@ -82,15 +111,21 @@ export function createResponsesHandler(deps: ResponsesDeps) {
         model,
         ...(rawRequestedModel && rawRequestedModel !== model ? { rawRequestedModel } : {}),
         stream,
-        ...(typeof (body as Record<string, unknown>).thinking === 'string' ? { thinking: (body as Record<string, unknown>).thinking } : {}),
-        ...(typeof (body as Record<string, unknown>).reasoning_effort === 'string' ? { reasoning_effort: (body as Record<string, unknown>).reasoning_effort } : {}),
+        ...(typeof (body as Record<string, unknown>).thinking === 'string'
+          ? { thinking: (body as Record<string, unknown>).thinking }
+          : {}),
+        ...(typeof (body as Record<string, unknown>).reasoning_effort === 'string'
+          ? { reasoning_effort: (body as Record<string, unknown>).reasoning_effort }
+          : {}),
       }),
     );
 
     if (
       deps.allowedModels &&
       deps.allowedModels.size > 0 &&
-      !buildAllowedModelCandidates(model, rawRequestedModel).some((candidate) => deps.allowedModels?.has(candidate))
+      !buildAllowedModelCandidates(model, rawRequestedModel).some((candidate) =>
+        deps.allowedModels?.has(candidate),
+      )
     ) {
       deps.traceStore.appendEvent(
         buildTraceEvent(requestId, 'responses_request_rejected', {
@@ -130,10 +165,12 @@ export function createResponsesHandler(deps: ResponsesDeps) {
           ...(contextLimitHit.routeId ? { routeId: contextLimitHit.routeId } : {}),
         }),
       );
-      return reply.code(400).send(buildContextLimitErrorPayload({
-        requestId,
-        ...contextLimitHit,
-      }));
+      return reply.code(400).send(
+        buildContextLimitErrorPayload({
+          requestId,
+          ...contextLimitHit,
+        }),
+      );
     }
 
     const upstream = await deps.fetchUpstream({
@@ -141,6 +178,8 @@ export function createResponsesHandler(deps: ResponsesDeps) {
       requestId,
       attempt: 1,
     });
+    const upstreamError =
+      upstream.status >= 400 ? await resolveUpstreamErrorDetails(upstream) : null;
 
     deps.traceStore.appendEvent(
       buildTraceEvent(requestId, 'responses_upstream_response', {
@@ -155,7 +194,21 @@ export function createResponsesHandler(deps: ResponsesDeps) {
     );
 
     if (upstream.status < 200 || upstream.status >= 300) {
-      const errorPayload = await readUpstreamErrorPayload(upstream);
+      deps.traceStore.appendEvent(
+        buildTraceEvent(requestId, 'responses_upstream_error', {
+          model,
+          stream,
+          status: upstream.status,
+          retryable: shouldRetryStatus(upstream.status, upstreamError),
+          ...(upstream.providerId ? { providerId: upstream.providerId } : {}),
+          ...(upstream.routeId ? { routeId: upstream.routeId } : {}),
+          ...(upstream.upstreamUrl ? { upstreamUrl: upstream.upstreamUrl } : {}),
+          ...(upstreamError?.type ? { upstreamErrorType: upstreamError.type } : {}),
+          ...(upstreamError?.code ? { upstreamErrorCode: upstreamError.code } : {}),
+          ...(upstreamError?.message ? { upstreamErrorMessage: upstreamError.message } : {}),
+          ...(upstreamError?.bodySnippet ? { upstreamBodySnippet: upstreamError.bodySnippet } : {}),
+        }),
+      );
       deps.traceStore.recordSummary({
         requestId,
         model,
@@ -167,7 +220,28 @@ export function createResponsesHandler(deps: ResponsesDeps) {
         errorClass: `http_${upstream.status}`,
         createdAt: nowTraceTimestamp(),
       });
-      return reply.code(upstream.status).send(errorPayload);
+
+      if (shouldRetryStatus(upstream.status, upstreamError)) {
+        return reply.code(502).send(
+          buildRetryExhaustedFailure({
+            requestId,
+            attempts: 1,
+            finalErrorClass: `http_${upstream.status}`,
+            upstreamStatus: upstream.status,
+            upstreamError,
+          }),
+        );
+      }
+
+      return reply.code(upstream.status).send(
+        buildTerminalFailure({
+          requestId,
+          attempts: 1,
+          finalErrorClass: `http_${upstream.status}`,
+          upstreamStatus: upstream.status,
+          upstreamError,
+        }),
+      );
     }
 
     if (stream) {
@@ -193,7 +267,10 @@ export function createResponsesHandler(deps: ResponsesDeps) {
       }
 
       const downstream = new PassThrough();
-      reply.header('content-type', upstream.headers['content-type'] ?? 'text/event-stream; charset=utf-8');
+      reply.header(
+        'content-type',
+        upstream.headers['content-type'] ?? 'text/event-stream; charset=utf-8',
+      );
       reply.header('cache-control', 'no-cache');
       reply.send(downstream);
 
@@ -231,7 +308,29 @@ export function createResponsesHandler(deps: ResponsesDeps) {
       return reply;
     }
 
-    const payload = await upstream.json();
+    // Handle non-JSON upstream responses (e.g., Cloudflare error pages, 403/502 HTML)
+    let payload: unknown;
+    try {
+      payload = await upstream.json();
+    } catch (jsonErr) {
+      const upstreamText = await (upstream.bodyText?.() ?? Promise.resolve('Unknown error'));
+      const errorMsg = `Upstream returned non-JSON response (status ${upstream.status}): ${upstreamText.slice(0, 500)}`;
+      deps.traceStore.appendEvent({
+        timestamp: new Date().toISOString(),
+        requestId,
+        event: 'request_failed',
+        model,
+        stream,
+        classification: 'upstream_non_json',
+      });
+      return reply.code(502).send({
+        error: {
+          message: errorMsg,
+          type: 'upstream_non_json',
+          status: upstream.status,
+        },
+      });
+    }
     deps.traceStore.recordSummary({
       requestId,
       model,

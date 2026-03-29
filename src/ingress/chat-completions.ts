@@ -16,6 +16,7 @@ import {
   buildRetryExhaustedFailure,
   buildStreamErrorEvent,
   buildTerminalFailure,
+  parseUpstreamErrorDetails,
 } from '../errors/terminal-payload.js';
 import {
   buildAllowedModelCandidates,
@@ -74,55 +75,6 @@ function sleep(ms: number): Promise<void> {
   }
 
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function truncateForTrace(value: string, maxLength = 240): string {
-  if (value.length <= maxLength) {
-    return value;
-  }
-
-  return `${value.slice(0, maxLength - 1)}...`;
-}
-
-function parseUpstreamErrorDetails(bodyText: string): UpstreamErrorDetails | null {
-  const trimmed = bodyText.trim();
-  if (!trimmed) {
-    return null;
-  }
-
-  let type: string | undefined;
-  let code: string | undefined;
-  let message: string | undefined;
-
-  try {
-    const parsed = JSON.parse(trimmed) as {
-      error?: { type?: unknown; code?: unknown; message?: unknown };
-      type?: unknown;
-      code?: unknown;
-      message?: unknown;
-    };
-    const source =
-      parsed.error && typeof parsed.error === 'object'
-        ? parsed.error
-        : parsed;
-    type = typeof source.type === 'string' ? source.type : undefined;
-    code = typeof source.code === 'string' ? source.code : undefined;
-    message = typeof source.message === 'string' ? source.message : undefined;
-  } catch {
-    // Keep a text snippet for non-JSON upstream failures.
-  }
-
-  const bodySnippet = truncateForTrace(trimmed, 400);
-  if (!type && !code && !message && !bodySnippet) {
-    return null;
-  }
-
-  return {
-    ...(type ? { type } : {}),
-    ...(code ? { code } : {}),
-    ...(message ? { message } : {}),
-    ...(bodySnippet ? { bodySnippet } : {}),
-  };
 }
 
 async function resolveUpstreamErrorDetails(upstream: UpstreamResponse): Promise<UpstreamErrorDetails | null> {
@@ -696,7 +648,35 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
               );
             }
           } else {
-            const payload = await upstream.json();
+            // Handle non-JSON upstream responses (e.g., Cloudflare error pages, 403/502 HTML)
+            let payload: unknown;
+            try {
+              payload = await upstream.json();
+            } catch (jsonErr) {
+              const upstreamText = await (upstream.bodyText?.() ?? Promise.resolve('Unknown error'));
+              const errorMsg = `Upstream returned non-JSON response (status ${upstream.status}): ${upstreamText.slice(0, 500)}`;
+              deps.traceStore.appendEvent(
+                buildTraceEvent(requestId, 'request_failed', {
+                  attempt,
+                  model,
+                  stream,
+                  classification: 'upstream_non_json',
+                }),
+              );
+              return reply.code(502).send(
+                buildTerminalFailure({
+                  requestId,
+                  attempts: attempt,
+                  finalErrorClass: 'upstream_non_json',
+                  upstreamStatus: upstream.status,
+                  upstreamError: {
+                    type: 'upstream_non_json',
+                    message: errorMsg,
+                    bodySnippet: upstreamText.slice(0, 200),
+                  },
+                }),
+              );
+            }
             attemptTokenUsage = await resolveAttemptTokenUsage({
               upstream,
               payload,

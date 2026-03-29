@@ -616,6 +616,87 @@ describe('POST /v1/chat/completions', () => {
     });
   });
 
+  test('surfaces provider-facing rate-limit error after retry exhaustion on 429', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'Q-router-429-exhausted-'));
+    const jsonlPath = join(tempDir, 'events.jsonl');
+    const sqlitePath = join(tempDir, 'summaries.sqlite');
+    const traceStore = createTraceStore({ jsonlPath, sqlitePath });
+
+    let attempts = 0;
+    const app = buildApp({
+      traceStore,
+      retryPolicy: {
+        maxAttempts: 2,
+        backoffMs: () => 0,
+      },
+      fetchUpstream: async () => {
+        attempts += 1;
+        return {
+          status: 429,
+          headers: {},
+          providerId: 'codex',
+          upstreamUrl: 'https://codex.example.test/v1/responses',
+          json: async () => ({
+            error: {
+              type: 'rate_limit_error',
+              code: 'USAGE_LIMIT_EXCEEDED',
+              message: 'daily usage limit exceeded',
+            },
+          }),
+          bodyText: async () => JSON.stringify({
+            error: {
+              type: 'rate_limit_error',
+              code: 'USAGE_LIMIT_EXCEEDED',
+              message: 'daily usage limit exceeded',
+            },
+          }),
+        };
+      },
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-5.4',
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(response.json()).toEqual({
+      error: {
+        message: '上游服务商限流或额度耗尽（429）：daily usage limit exceeded',
+        type: 'provider_rate_limited',
+        request_id: expect.any(String),
+        attempts: 2,
+        final_error_class: 'http_429',
+        upstream_status: 429,
+        upstream_error: {
+          type: 'rate_limit_error',
+          code: 'USAGE_LIMIT_EXCEEDED',
+          message: 'daily usage limit exceeded',
+          body_snippet: expect.stringContaining('USAGE_LIMIT_EXCEEDED'),
+        },
+      },
+    });
+    expect(attempts).toBe(2);
+
+    await app.close();
+
+    const jsonl = readFileSync(jsonlPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    expect(jsonl).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ event: 'upstream_error', status: 429, retryable: true }),
+        expect.objectContaining({ event: 'retry_scheduled', classification: 'http_429' }),
+        expect.objectContaining({ event: 'request_completed', classification: 'http_429', committed: false }),
+      ]),
+    );
+  });
+
   test('surfaces parsed upstream error details for non-retryable terminal failures', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'Q-router-terminal-error-'));
     const jsonlPath = join(tempDir, 'events.jsonl');

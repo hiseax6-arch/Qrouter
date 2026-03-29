@@ -177,6 +177,18 @@ export function buildApp(options: BuildAppOptions = {}) {
 }
 
 async function main() {
+  // Global error handlers to prevent process crash on uncaught exceptions
+  process.on('uncaughtException', (error) => {
+    console.error('[Q-router] Uncaught exception:', error);
+    // Log and exit gracefully; systemd will restart
+    process.exit(1);
+  });
+
+  process.on('unhandledRejection', (reason, promise) => {
+    console.error('[Q-router] Unhandled rejection at:', promise, 'reason:', reason);
+    // Log but don't exit; let the error propagate naturally
+  });
+
   const routerConfig = loadRouterRuntimeConfig();
   const app = buildApp({ routerConfig });
   await app.listen({ host: routerConfig.server.host, port: routerConfig.server.port });

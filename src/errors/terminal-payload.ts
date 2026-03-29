@@ -5,6 +5,55 @@ type UpstreamFailureDetails = {
   bodySnippet?: string;
 };
 
+function truncateForTrace(value: string, maxLength = 240): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+
+  return `${value.slice(0, maxLength - 1)}...`;
+}
+
+export function parseUpstreamErrorDetails(bodyText: string): UpstreamFailureDetails | null {
+  const trimmed = bodyText.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  let type: string | undefined;
+  let code: string | undefined;
+  let message: string | undefined;
+
+  try {
+    const parsed = JSON.parse(trimmed) as {
+      error?: { type?: unknown; code?: unknown; message?: unknown };
+      type?: unknown;
+      code?: unknown;
+      message?: unknown;
+    };
+    const source =
+      parsed.error && typeof parsed.error === 'object'
+        ? parsed.error
+        : parsed;
+    type = typeof source.type === 'string' ? source.type : undefined;
+    code = typeof source.code === 'string' ? source.code : undefined;
+    message = typeof source.message === 'string' ? source.message : undefined;
+  } catch {
+    // Keep a text snippet for non-JSON upstream failures.
+  }
+
+  const bodySnippet = truncateForTrace(trimmed, 400);
+  if (!type && !code && !message && !bodySnippet) {
+    return null;
+  }
+
+  return {
+    ...(type ? { type } : {}),
+    ...(code ? { code } : {}),
+    ...(message ? { message } : {}),
+    ...(bodySnippet ? { bodySnippet } : {}),
+  };
+}
+
 export function buildEmptySuccessFailure(args: {
   requestId: string;
   attempts: number;
@@ -27,14 +76,20 @@ export function buildRetryExhaustedFailure(args: {
   upstreamStatus?: number | null;
   upstreamError?: UpstreamFailureDetails | null;
 }) {
-  const message = args.upstreamError?.message
-    ? `Upstream ${args.upstreamStatus ?? 'error'}: ${args.upstreamError.message}`
-    : 'Upstream request failed after retries.';
+  const isProvider429 = args.finalErrorClass === 'http_429' || args.upstreamStatus === 429;
+
+  const message = isProvider429
+    ? args.upstreamError?.message
+      ? `上游服务商限流或额度耗尽（429）：${args.upstreamError.message}`
+      : '上游服务商限流或额度耗尽，请稍后重试或切换模型。'
+    : args.upstreamError?.message
+      ? `Upstream ${args.upstreamStatus ?? 'error'}: ${args.upstreamError.message}`
+      : 'Upstream request failed after retries.';
 
   return {
     error: {
       message,
-      type: 'upstream_retry_exhausted',
+      type: isProvider429 ? 'provider_rate_limited' : 'upstream_retry_exhausted',
       request_id: args.requestId,
       attempts: args.attempts,
       final_error_class: args.finalErrorClass,

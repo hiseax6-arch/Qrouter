@@ -952,7 +952,17 @@ function createLazyPayloadLoader(response: Response): () => Promise<unknown> {
   let payloadPromise: Promise<unknown> | undefined;
   return () => {
     if (!payloadPromise) {
-      payloadPromise = response.json();
+      payloadPromise = response.json().catch((err) => {
+        // When upstream returns non-JSON (e.g., Cloudflare error page),
+        // return a structured error instead of crashing the process.
+        return {
+          error: {
+            message: `Upstream returned non-JSON response: ${err.message}`,
+            type: 'upstream_non_json',
+            status: response.status,
+          },
+        };
+      });
     }
     return payloadPromise;
   };

@@ -35,7 +35,7 @@ export type RouterRouteConfig = {
   provider: string;
   aliases?: string[];
   model?: string;
-  strategy?: 'direct' | 'round-robin';
+  strategy?: 'direct' | 'round-robin' | 'sticky-failover';
   members?: string[];
 };
 
@@ -80,8 +80,16 @@ export type RouterFileConfig = {
   };
 };
 
+export type RouterMappingsFileConfig =
+  | {
+      routes?: RouterRouteConfig[];
+      thinking?: RouterThinkingConfig;
+    }
+  | RouterRouteConfig[];
+
 export type RouterRuntimeConfig = {
   configPath: string;
+  routeMappingsPath?: string;
   server: {
     host: string;
     port: number;
@@ -181,6 +189,11 @@ function resolveProjectRelativeConfigPath(): string {
   return resolve(moduleDir, '../../config/router.json');
 }
 
+function resolveProjectRelativeMappingsPath(): string {
+  const moduleDir = dirname(fileURLToPath(import.meta.url));
+  return resolve(moduleDir, '../../config/model-mappings.json');
+}
+
 export function resolveRouterConfigPath(): string {
   const explicit = firstDefinedEnv('Q_ROUTER_CONFIG_PATH', 'QINGFU_ROUTER_CONFIG_PATH').value;
   if (explicit) {
@@ -195,6 +208,33 @@ export function resolveRouterConfigPath(): string {
   return resolveProjectRelativeConfigPath();
 }
 
+export function resolveRouterMappingsPath(configPath = resolveRouterConfigPath()): string | undefined {
+  const explicit = firstDefinedEnv('Q_ROUTER_MAPPINGS_PATH', 'QINGFU_ROUTER_MAPPINGS_PATH').value;
+  if (explicit) {
+    return resolve(explicit);
+  }
+
+  const cwdCandidate = resolve(process.cwd(), 'config/model-mappings.json');
+  if (existsSync(cwdCandidate)) {
+    return cwdCandidate;
+  }
+
+  const siblingCandidate = resolve(dirname(configPath), 'model-mappings.json');
+  if (existsSync(siblingCandidate)) {
+    return siblingCandidate;
+  }
+
+  const projectConfigPath = resolveProjectRelativeConfigPath();
+  if (resolve(configPath) === projectConfigPath) {
+    const projectCandidate = resolveProjectRelativeMappingsPath();
+    if (existsSync(projectCandidate)) {
+      return projectCandidate;
+    }
+  }
+
+  return undefined;
+}
+
 function readRouterFileConfig(configPath: string): RouterFileConfig {
   if (!existsSync(configPath)) {
     return {};
@@ -203,11 +243,45 @@ function readRouterFileConfig(configPath: string): RouterFileConfig {
   return JSON.parse(readFileSync(configPath, 'utf8')) as RouterFileConfig;
 }
 
+function readRouterMappingsFileConfig(
+  mappingsPath: string | undefined,
+): { routes: RouterRouteConfig[]; thinking?: RouterThinkingConfig; path?: string } {
+  if (!mappingsPath || !existsSync(mappingsPath)) {
+    return {
+      routes: [],
+    };
+  }
+
+  const parsed = JSON.parse(readFileSync(mappingsPath, 'utf8')) as RouterMappingsFileConfig;
+  const routes = Array.isArray(parsed)
+    ? parsed
+    : Array.isArray(parsed.routes)
+      ? parsed.routes
+      : [];
+  const thinking =
+    !Array.isArray(parsed) &&
+    parsed.thinking &&
+    typeof parsed.thinking === 'object'
+      ? parsed.thinking
+      : undefined;
+
+  return {
+    routes,
+    ...(thinking ? { thinking } : {}),
+    path: mappingsPath,
+  };
+}
+
 export function loadRouterRuntimeConfig(): RouterRuntimeConfig {
   const configPath = resolveRouterConfigPath();
   const fileConfig = readRouterFileConfig(configPath);
-  const configuredRoutes = fileConfig.routes ?? [];
+  const mappingsConfig = readRouterMappingsFileConfig(resolveRouterMappingsPath(configPath));
+  const configuredRoutes =
+    Array.isArray(fileConfig.routes) && fileConfig.routes.length > 0
+      ? fileConfig.routes
+      : mappingsConfig.routes;
   const configuredAllow = fileConfig.models?.allow ?? [];
+  const mappingsThinking = mappingsConfig.thinking;
 
   const serverHost = firstDefinedEnv('Q_ROUTER_HOST', 'QINGFU_ROUTER_HOST').value ?? fileConfig.server?.host ?? '127.0.0.1';
   const serverPort = parseNumber(
@@ -241,6 +315,7 @@ export function loadRouterRuntimeConfig(): RouterRuntimeConfig {
 
   return {
     configPath,
+    ...(mappingsConfig.path ? { routeMappingsPath: mappingsConfig.path } : {}),
     server: {
       host: serverHost,
       port: serverPort,
@@ -259,9 +334,9 @@ export function loadRouterRuntimeConfig(): RouterRuntimeConfig {
           : uniqueStrings(configuredRoutes.flatMap((route) => route.aliases ?? [])),
     },
     thinking: {
-      defaultMode: fileConfig.thinking?.defaultMode ?? 'pass-through',
-      mappingsEnabled: fileConfig.thinking?.mappingsEnabled ?? true,
-      mappings: fileConfig.thinking?.mappings ?? [],
+      defaultMode: mappingsThinking?.defaultMode ?? fileConfig.thinking?.defaultMode ?? 'pass-through',
+      mappingsEnabled: mappingsThinking?.mappingsEnabled ?? fileConfig.thinking?.mappingsEnabled ?? true,
+      mappings: mappingsThinking?.mappings ?? fileConfig.thinking?.mappings ?? [],
     },
     traces: {
       dir: firstDefinedEnv('Q_TRACE_DIR', 'QINGFU_TRACE_DIR').value ?? fileConfig.traces?.dir,

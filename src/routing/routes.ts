@@ -76,6 +76,9 @@ function defaultExplicitRouteId(route: RouterRouteConfig, index: number): string
   if (strategy === 'round-robin') {
     return `${route.provider}:round-robin:${index}`;
   }
+  if (strategy === 'sticky-failover') {
+    return `${route.provider}:sticky-failover:${index}`;
+  }
 
   return `${route.provider}:${route.model ?? index}`;
 }
@@ -84,7 +87,7 @@ function buildExplicitRoute(route: RouterRouteConfig, index: number): CompiledRo
   const strategy = route.strategy ?? 'direct';
   const model = route.model ? stripProviderPrefix(route.model, route.provider) : undefined;
 
-  if (strategy === 'round-robin') {
+  if (strategy === 'round-robin' || strategy === 'sticky-failover') {
     return {
       id: defaultExplicitRouteId(route, index),
       source: 'explicit',

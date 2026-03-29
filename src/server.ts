@@ -13,11 +13,43 @@ export type BuildAppOptions = {
   routerConfig?: RouterRuntimeConfig;
 };
 
+const DEFAULT_RETRIES_BEFORE_VISIBLE_REPLY = 3;
+
 const defaultRetryPolicy: RetryPolicy = {
-  maxAttempts: 3,
+  maxAttempts: DEFAULT_RETRIES_BEFORE_VISIBLE_REPLY + 1,
   backoffMs: () => 0,
 };
 const emittedConfigWarnings = new Set<string>();
+
+function parseBooleanQuery(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value === 'number') {
+    if (value === 1) {
+      return true;
+    }
+    if (value === 0) {
+      return false;
+    }
+    return undefined;
+  }
+
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'true' || normalized === '1') {
+    return true;
+  }
+  if (normalized === 'false' || normalized === '0') {
+    return false;
+  }
+
+  return undefined;
+}
 
 export function buildApp(options: BuildAppOptions = {}) {
   const app = Fastify();
@@ -90,6 +122,7 @@ export function buildApp(options: BuildAppOptions = {}) {
     pid: process.pid,
     cwd: process.cwd(),
     configPath: routerConfig.configPath,
+    ...(routerConfig.routeMappingsPath ? { routeMappingsPath: routerConfig.routeMappingsPath } : {}),
     server: routerConfig.server,
     providers: Object.keys(routerConfig.providers),
     modelsAllowCount: routerConfig.models.allow.length,
@@ -150,6 +183,174 @@ export function buildApp(options: BuildAppOptions = {}) {
     };
   });
 
+  app.get('/stats/requests', async (request) => {
+    const query = (request.query ?? {}) as {
+      endpoint?: string;
+      provider_id?: string;
+      route_id?: string;
+      failover_used?: string | number | boolean;
+      model?: string;
+      requested_model?: string;
+      upstream_model?: string;
+      final_classification?: string;
+      committed?: string | number | boolean;
+      limit?: string | number;
+    };
+    const limit =
+      typeof query.limit === 'number'
+        ? query.limit
+        : typeof query.limit === 'string' && query.limit.trim().length > 0
+          ? Number(query.limit)
+          : undefined;
+
+    const items = traceStore.listRequestSummaries({
+      ...(typeof query.endpoint === 'string' && query.endpoint.trim().length > 0
+        ? { endpoint: query.endpoint.trim() }
+        : {}),
+      ...(typeof query.provider_id === 'string' && query.provider_id.trim().length > 0
+        ? { providerId: query.provider_id.trim() }
+        : {}),
+      ...(typeof query.route_id === 'string' && query.route_id.trim().length > 0
+        ? { routeId: query.route_id.trim() }
+        : {}),
+      ...(typeof query.model === 'string' && query.model.trim().length > 0
+        ? { model: query.model.trim() }
+        : {}),
+      ...(typeof query.requested_model === 'string' && query.requested_model.trim().length > 0
+        ? { requestedModel: query.requested_model.trim() }
+        : {}),
+      ...(typeof query.upstream_model === 'string' && query.upstream_model.trim().length > 0
+        ? { upstreamModel: query.upstream_model.trim() }
+        : {}),
+      ...(typeof query.final_classification === 'string' && query.final_classification.trim().length > 0
+        ? { finalClassification: query.final_classification.trim() }
+        : {}),
+      ...(typeof parseBooleanQuery(query.failover_used) === 'boolean'
+        ? { failoverUsed: parseBooleanQuery(query.failover_used) }
+        : {}),
+      ...(typeof parseBooleanQuery(query.committed) === 'boolean'
+        ? { committed: parseBooleanQuery(query.committed) }
+        : {}),
+      ...(typeof limit === 'number' && Number.isFinite(limit) && limit > 0 ? { limit } : {}),
+    });
+
+    return {
+      items,
+    };
+  });
+
+  app.get('/stats/requests/aggregate', async (request) => {
+    const query = (request.query ?? {}) as {
+      endpoint?: string;
+      provider_id?: string;
+      route_id?: string;
+      failover_used?: string | number | boolean;
+      model?: string;
+      requested_model?: string;
+      upstream_model?: string;
+      final_classification?: string;
+      committed?: string | number | boolean;
+      limit?: string | number;
+    };
+    const limit =
+      typeof query.limit === 'number'
+        ? query.limit
+        : typeof query.limit === 'string' && query.limit.trim().length > 0
+          ? Number(query.limit)
+          : undefined;
+
+    const items = traceStore.aggregateRequestSummaries({
+      ...(typeof query.endpoint === 'string' && query.endpoint.trim().length > 0
+        ? { endpoint: query.endpoint.trim() }
+        : {}),
+      ...(typeof query.provider_id === 'string' && query.provider_id.trim().length > 0
+        ? { providerId: query.provider_id.trim() }
+        : {}),
+      ...(typeof query.route_id === 'string' && query.route_id.trim().length > 0
+        ? { routeId: query.route_id.trim() }
+        : {}),
+      ...(typeof query.model === 'string' && query.model.trim().length > 0
+        ? { model: query.model.trim() }
+        : {}),
+      ...(typeof query.requested_model === 'string' && query.requested_model.trim().length > 0
+        ? { requestedModel: query.requested_model.trim() }
+        : {}),
+      ...(typeof query.upstream_model === 'string' && query.upstream_model.trim().length > 0
+        ? { upstreamModel: query.upstream_model.trim() }
+        : {}),
+      ...(typeof query.final_classification === 'string' && query.final_classification.trim().length > 0
+        ? { finalClassification: query.final_classification.trim() }
+        : {}),
+      ...(typeof parseBooleanQuery(query.failover_used) === 'boolean'
+        ? { failoverUsed: parseBooleanQuery(query.failover_used) }
+        : {}),
+      ...(typeof parseBooleanQuery(query.committed) === 'boolean'
+        ? { committed: parseBooleanQuery(query.committed) }
+        : {}),
+      ...(typeof limit === 'number' && Number.isFinite(limit) && limit > 0 ? { limit } : {}),
+    });
+
+    return {
+      items,
+    };
+  });
+
+  app.get('/stats/routes/health', async (request) => {
+    const query = (request.query ?? {}) as {
+      endpoint?: string;
+      provider_id?: string;
+      route_id?: string;
+      failover_used?: string | number | boolean;
+      model?: string;
+      requested_model?: string;
+      upstream_model?: string;
+      final_classification?: string;
+      committed?: string | number | boolean;
+      limit?: string | number;
+    };
+    const limit =
+      typeof query.limit === 'number'
+        ? query.limit
+        : typeof query.limit === 'string' && query.limit.trim().length > 0
+          ? Number(query.limit)
+          : undefined;
+
+    const items = traceStore.listRouteHealth({
+      ...(typeof query.endpoint === 'string' && query.endpoint.trim().length > 0
+        ? { endpoint: query.endpoint.trim() }
+        : {}),
+      ...(typeof query.provider_id === 'string' && query.provider_id.trim().length > 0
+        ? { providerId: query.provider_id.trim() }
+        : {}),
+      ...(typeof query.route_id === 'string' && query.route_id.trim().length > 0
+        ? { routeId: query.route_id.trim() }
+        : {}),
+      ...(typeof query.model === 'string' && query.model.trim().length > 0
+        ? { model: query.model.trim() }
+        : {}),
+      ...(typeof query.requested_model === 'string' && query.requested_model.trim().length > 0
+        ? { requestedModel: query.requested_model.trim() }
+        : {}),
+      ...(typeof query.upstream_model === 'string' && query.upstream_model.trim().length > 0
+        ? { upstreamModel: query.upstream_model.trim() }
+        : {}),
+      ...(typeof query.final_classification === 'string' && query.final_classification.trim().length > 0
+        ? { finalClassification: query.final_classification.trim() }
+        : {}),
+      ...(typeof parseBooleanQuery(query.failover_used) === 'boolean'
+        ? { failoverUsed: parseBooleanQuery(query.failover_used) }
+        : {}),
+      ...(typeof parseBooleanQuery(query.committed) === 'boolean'
+        ? { committed: parseBooleanQuery(query.committed) }
+        : {}),
+      ...(typeof limit === 'number' && Number.isFinite(limit) && limit > 0 ? { limit } : {}),
+    });
+
+    return {
+      items,
+    };
+  });
+
   app.post(
     '/v1/chat/completions',
     createChatCompletionsHandler({
@@ -166,6 +367,7 @@ export function buildApp(options: BuildAppOptions = {}) {
     '/v1/responses',
     createResponsesHandler({
       fetchUpstream: fetchResponsesUpstream,
+      retryPolicy: options.retryPolicy ?? defaultRetryPolicy,
       traceStore,
       allowedModels,
       routes: routingTable.routes,

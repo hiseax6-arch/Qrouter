@@ -1,0 +1,104 @@
+{
+  "routes": [
+    {
+      "id": "openrouter-stepfun",
+      "provider": "openrouter",
+      "aliases": [
+        "LR/stepfun/step-3.5-flash:free",
+        "stepfun/step-3.5-flash:free",
+        "openrouter/stepfun/step-3.5-flash:free"
+      ],
+      "model": "stepfun/step-3.5-flash:free"
+    },
+    {
+      "id": "openrouter-trinity-large",
+      "provider": "openrouter",
+      "aliases": [
+        "arcee-ai/trinity-large-preview:free",
+        "openrouter/arcee-ai/trinity-large-preview:free"
+      ],
+      "model": "arcee-ai/trinity-large-preview:free"
+    },
+    {
+      "id": "codex-main",
+      "provider": "codex",
+      "aliases": [
+        "LR/gpt-5.4",
+        "gpt-5.4",
+        "codex/gpt-5.4"
+      ],
+      "model": "gpt-5.4"
+    },
+    {
+      "id": "modelscope-minimax",
+      "provider": "modelscope",
+      "aliases": [
+        "MiniMax/MiniMax-M2.5",
+        "modelscope/MiniMax/MiniMax-M2.5"
+      ],
+      "model": "MiniMax/MiniMax-M2.5"
+    },
+    {
+      "id": "modelscope-glm5",
+      "provider": "modelscope",
+      "aliases": [
+        "ZhipuAI/GLM-5",
+        "modelscope/ZhipuAI/GLM-5"
+      ],
+      "model": "ZhipuAI/GLM-5"
+    },
+    {
+      "id": "modelscope-qwen3",
+      "provider": "modelscope",
+      "aliases": [
+        "Qwen/Qwen3-235B-A22B",
+        "modelscope/Qwen/Qwen3-235B-A22B"
+      ],
+      "model": "Qwen/Qwen3-235B-A22B"
+    },
+    {
+      "id": "modelscope-kimi",
+      "provider": "modelscope",
+      "aliases": [
+        "moonshotai/Kimi-K2.5",
+        "modelscope/moonshotai/Kimi-K2.5"
+      ],
+      "model": "moonshotai/Kimi-K2.5"
+    },
+    {
+      "id": "modelscope-ms-pool",
+      "provider": "modelscope",
+      "strategy": "sticky-failover",
+      "aliases": [
+        "LR/ms",
+        "ms"
+      ],
+      "members": [
+        "MiniMax/MiniMax-M2.5",
+        "ZhipuAI/GLM-5",
+        "Qwen/Qwen3-235B-A22B",
+        "moonshotai/Kimi-K2.5"
+      ]
+    }
+  ],
+  "thinking": {
+    "defaultMode": "pass-through",
+    "mappingsEnabled": false,
+    "mappings": [
+      {
+        "match": [
+          "LR/gpt-5.4",
+          "gpt-5.4"
+        ],
+        "when": {
+          "thinking": "low"
+        },
+        "rewrite": {
+          "reasoning": {
+            "effort": "xhigh"
+          }
+        }
+      }
+    ]
+  }
+}

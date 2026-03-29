@@ -1,4 +1,4 @@
-type UpstreamFailureDetails = {
+export type UpstreamFailureDetails = {
   type?: string;
   code?: string;
   message?: string;

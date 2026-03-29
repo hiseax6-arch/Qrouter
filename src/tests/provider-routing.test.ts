@@ -2052,4 +2052,130 @@ describe('provider-aware upstream routing', () => {
 
     await app.close();
   });
+
+  test('rejects oversized chat completions requests locally before upstream fetch', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        codex: {
+          api: 'openai-responses',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://codex.example.test/v1',
+          models: [
+            {
+              id: 'gpt-5.4',
+              name: 'GPT-5.4',
+              contextWindow: 10,
+            },
+          ],
+        },
+      },
+      routes: [
+        {
+          id: 'codex-main',
+          provider: 'codex',
+          aliases: ['LR/gpt-5.4', 'gpt-5.4'],
+          model: 'gpt-5.4',
+        },
+      ],
+    });
+
+    chdir(dir);
+    process.env.Q_CODEX_API_KEY = 'codex-secret';
+
+    const fetchSpy = vi.fn();
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'LR/gpt-5.4',
+        messages: [{ role: 'user', content: 'x'.repeat(200) }],
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({
+      error: {
+        type: 'context_window_exceeded',
+        model: 'LR/gpt-5.4',
+        normalized_model: 'gpt-5.4',
+        context_window: 10,
+        provider_id: 'codex',
+        route_id: 'codex-main',
+      },
+    });
+    expect((response.json() as { error: { estimated_input_tokens: number } }).error.estimated_input_tokens).toBeGreaterThan(10);
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    await app.close();
+  });
+
+  test('rejects oversized responses requests locally before upstream fetch', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        codex: {
+          api: 'openai-responses',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://codex.example.test/v1',
+          models: [
+            {
+              id: 'gpt-5.4',
+              name: 'GPT-5.4',
+              contextWindow: 10,
+            },
+          ],
+        },
+      },
+      routes: [
+        {
+          id: 'codex-main',
+          provider: 'codex',
+          aliases: ['LR/gpt-5.4', 'gpt-5.4'],
+          model: 'gpt-5.4',
+        },
+      ],
+    });
+
+    chdir(dir);
+    process.env.Q_CODEX_API_KEY = 'codex-secret';
+
+    const fetchSpy = vi.fn();
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'LR/gpt-5.4',
+        input: 'x'.repeat(200),
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({
+      error: {
+        type: 'context_window_exceeded',
+        model: 'LR/gpt-5.4',
+        normalized_model: 'gpt-5.4',
+        context_window: 10,
+        provider_id: 'codex',
+        route_id: 'codex-main',
+      },
+    });
+    expect((response.json() as { error: { estimated_input_tokens: number } }).error.estimated_input_tokens).toBeGreaterThan(10);
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    await app.close();
+  });
 });

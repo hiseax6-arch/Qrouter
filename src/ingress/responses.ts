@@ -5,6 +5,7 @@ import {
   buildAllowedModelCandidates,
   resolveRequestedModelAlias,
 } from './model-normalization.js';
+import { buildContextLimitErrorPayload, checkContextLimit } from './context-limit.js';
 import type { CompiledRoute } from '../routing/routes.js';
 import { nowTraceTimestamp, type TraceStore } from '../traces/store.js';
 import type { FetchUpstream } from '../upstream/client.js';
@@ -14,6 +15,7 @@ export type ResponsesDeps = {
   traceStore: TraceStore;
   allowedModels?: Set<string>;
   routes?: CompiledRoute[];
+  providers?: Record<string, import('../config/router.js').RouterProviderConfig>;
 };
 
 type ResponsesRequestBody = {
@@ -105,6 +107,33 @@ export function createResponsesHandler(deps: ResponsesDeps) {
           model,
         },
       });
+    }
+
+    const contextLimitHit = deps.providers
+      ? checkContextLimit({
+          body: body as Record<string, unknown>,
+          providers: deps.providers,
+          routes: deps.routes,
+          endpoint: 'responses',
+        })
+      : null;
+    if (contextLimitHit) {
+      deps.traceStore.appendEvent(
+        buildTraceEvent(requestId, 'responses_request_rejected', {
+          model,
+          ...(rawRequestedModel && rawRequestedModel !== model ? { rawRequestedModel } : {}),
+          stream,
+          classification: 'context_window_exceeded',
+          estimatedInputTokens: contextLimitHit.estimatedInputTokens,
+          contextWindow: contextLimitHit.contextWindow,
+          ...(contextLimitHit.providerId ? { providerId: contextLimitHit.providerId } : {}),
+          ...(contextLimitHit.routeId ? { routeId: contextLimitHit.routeId } : {}),
+        }),
+      );
+      return reply.code(400).send(buildContextLimitErrorPayload({
+        requestId,
+        ...contextLimitHit,
+      }));
     }
 
     const upstream = await deps.fetchUpstream({

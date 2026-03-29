@@ -21,6 +21,7 @@ import {
   buildAllowedModelCandidates,
   resolveRequestedModelAlias,
 } from './model-normalization.js';
+import { buildContextLimitErrorPayload, checkContextLimit } from './context-limit.js';
 import type { CompiledRoute } from '../routing/routes.js';
 import {
   advanceStickyFailoverRoute,
@@ -42,6 +43,7 @@ export type ChatCompletionsDeps = {
   traceStore: TraceStore;
   allowedModels?: Set<string>;
   routes?: CompiledRoute[];
+  providers?: Record<string, import('../config/router.js').RouterProviderConfig>;
 };
 
 type ChatCompletionsRequestBody = {
@@ -490,6 +492,34 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
           model,
         },
       });
+    }
+
+    const contextLimitHit = deps.providers
+      ? checkContextLimit({
+          body: body as Record<string, unknown>,
+          providers: deps.providers,
+          routes: deps.routes,
+          endpoint: 'chat.completions',
+        })
+      : null;
+    if (contextLimitHit) {
+      deps.traceStore.appendEvent(
+        buildTraceEvent(requestId, 'request_rejected', {
+          model,
+          ...(rawRequestedModel && rawRequestedModel !== requestedModel ? { rawRequestedModel } : {}),
+          ...(requestedModel && requestedModel !== model ? { requestedModel } : {}),
+          stream,
+          classification: 'context_window_exceeded',
+          estimatedInputTokens: contextLimitHit.estimatedInputTokens,
+          contextWindow: contextLimitHit.contextWindow,
+          ...(contextLimitHit.providerId ? { providerId: contextLimitHit.providerId } : {}),
+          ...(contextLimitHit.routeId ? { routeId: contextLimitHit.routeId } : {}),
+        }),
+      );
+      return reply.code(400).send(buildContextLimitErrorPayload({
+        requestId,
+        ...contextLimitHit,
+      }));
     }
 
     let committed = false;

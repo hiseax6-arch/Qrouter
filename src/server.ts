@@ -158,6 +158,7 @@ export function buildApp(options: BuildAppOptions = {}) {
       traceStore,
       allowedModels,
       routes: routingTable.routes,
+      providers: routerConfig.providers,
     }),
   );
 
@@ -168,6 +169,7 @@ export function buildApp(options: BuildAppOptions = {}) {
       traceStore,
       allowedModels,
       routes: routingTable.routes,
+      providers: routerConfig.providers,
     }),
   );
 

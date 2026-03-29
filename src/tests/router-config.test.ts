@@ -11,9 +11,11 @@ const envKeys = [
   'Q_ROUTER_CONFIG_PATH',
   'Q_ROUTER_PORT',
   'Q_ROUTER_HOST',
+  'Q_ROUTER_MAPPINGS_PATH',
   'QINGFU_ROUTER_CONFIG_PATH',
   'QINGFU_ROUTER_PORT',
   'QINGFU_ROUTER_HOST',
+  'QINGFU_ROUTER_MAPPINGS_PATH',
   'Q_UPSTREAM_BASE_URL',
   'Q_UPSTREAM_API_KEY',
   'Q_UPSTREAM_TIMEOUT_MS',
@@ -36,12 +38,15 @@ afterEach(() => {
   }
 });
 
-function writeRouterConfig(config: unknown): string {
+function writeRouterConfig(config: unknown, mappings?: unknown): string {
   const dir = mkdtempSync(join(tmpdir(), 'Q-router-config-'));
   const configDir = join(dir, 'config');
   mkdirSync(configDir, { recursive: true });
   const configPath = join(configDir, 'router.json');
   writeFileSync(configPath, JSON.stringify(config, null, 2));
+  if (mappings !== undefined) {
+    writeFileSync(join(configDir, 'model-mappings.json'), JSON.stringify(mappings, null, 2));
+  }
   return dir;
 }
 
@@ -208,6 +213,92 @@ describe('router config file', () => {
     expect(runtime.models.allow).toEqual(['LR/gpt-5.4', 'gpt-5.4', 'codex/gpt-5.4']);
     expect(runtime.providers.codex.apiKey).toBe('codex-secret');
     expect(runtime.providers.codex.apiKeySource).toBe('env:CUSTOM_CODEX_ENV');
+  });
+
+  test('loads routes from config/model-mappings.json and derives allow-list when router.json omits routes', () => {
+    const dir = writeRouterConfig({
+      upstream: {
+        baseUrl: 'https://example.test/v1',
+      },
+      providers: {
+        codex: {
+          api: 'openai-responses',
+          apiKeyEnv: 'CUSTOM_CODEX_ENV',
+          baseUrl: 'https://codex.example.test/v1',
+          models: [{ id: 'gpt-5.4', name: 'GPT-5.4' }],
+        },
+      },
+    }, {
+      routes: [
+        {
+          id: 'codex-main',
+          provider: 'codex',
+          aliases: ['LR/gpt-5.4', 'gpt-5.4', 'codex/gpt-5.4'],
+          model: 'gpt-5.4',
+        },
+      ],
+    });
+
+    chdir(dir);
+    process.env.CUSTOM_CODEX_ENV = 'codex-secret';
+
+    const runtime = loadRouterRuntimeConfig();
+
+    expect(runtime.routeMappingsPath).toBe(join(dir, 'config', 'model-mappings.json'));
+    expect(runtime.routes).toEqual([
+      {
+        id: 'codex-main',
+        provider: 'codex',
+        aliases: ['LR/gpt-5.4', 'gpt-5.4', 'codex/gpt-5.4'],
+        model: 'gpt-5.4',
+      },
+    ]);
+    expect(runtime.models.allow).toEqual(['LR/gpt-5.4', 'gpt-5.4', 'codex/gpt-5.4']);
+    expect(runtime.providers.codex.apiKey).toBe('codex-secret');
+  });
+
+  test('loads thinking mappings from config/model-mappings.json when router.json omits them', () => {
+    const dir = writeRouterConfig({
+      providers: {
+        codex: {
+          api: 'openai-responses',
+          baseUrl: 'https://codex.example.test/v1',
+          models: [{ id: 'gpt-5.4', name: 'GPT-5.4' }],
+        },
+      },
+      models: {
+        allow: ['gpt-5.4'],
+      },
+    }, {
+      thinking: {
+        defaultMode: 'pass-through',
+        mappingsEnabled: true,
+        mappings: [
+          {
+            match: ['LR/gpt-5.4', 'gpt-5.4'],
+            when: { thinking: 'low' },
+            rewrite: { reasoning: { effort: 'xhigh' } },
+          },
+        ],
+      },
+    });
+
+    chdir(dir);
+
+    const runtime = loadRouterRuntimeConfig();
+
+    expect(runtime.routeMappingsPath).toBe(join(dir, 'config', 'model-mappings.json'));
+    expect(runtime.thinking).toEqual({
+      defaultMode: 'pass-through',
+      mappingsEnabled: true,
+      mappings: [
+        {
+          match: ['LR/gpt-5.4', 'gpt-5.4'],
+          when: { thinking: 'low' },
+          rewrite: { reasoning: { effort: 'xhigh' } },
+        },
+      ],
+    });
   });
 
   test('rejects models that are not listed in config/router.json', async () => {

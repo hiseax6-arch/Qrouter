@@ -187,6 +187,122 @@ describe('POST /v1/chat/completions', () => {
     });
   });
 
+  test('intercepts OpenClaw slash commands like /agents on chat-completions without upstream fetch', async () => {
+    let called = false;
+    const app = buildApp({
+      traceStore: createNoopTraceStore(),
+      fetchUpstream: async () => {
+        called = true;
+        return {
+          status: 200,
+          headers: {},
+          json: async () => ({
+            id: 'resp-should-not-run',
+            choices: [
+              {
+                message: {
+                  role: 'assistant',
+                  content: 'should not happen',
+                },
+              },
+            ],
+          }),
+        };
+      },
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-5.4',
+        messages: [{ role: 'user', content: '/agents' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      object: 'chat.completion',
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: expect.stringContaining('/agents'),
+          },
+        },
+      ],
+    });
+    expect(response.body).toContain('Q-router 已在本地拦截该命令');
+    expect(called).toBe(false);
+
+    await app.close();
+  });
+
+  test('intercepts OpenClaw slash commands like /agents on responses without upstream fetch', async () => {
+    let called = false;
+    const app = buildApp({
+      traceStore: createNoopTraceStore(),
+      fetchUpstream: async () => {
+        called = true;
+        return {
+          status: 200,
+          headers: {},
+          json: async () => ({
+            id: 'resp-should-not-run',
+            output: [
+              {
+                type: 'message',
+                role: 'assistant',
+                content: [
+                  {
+                    type: 'output_text',
+                    text: 'should not happen',
+                  },
+                ],
+              },
+            ],
+          }),
+        };
+      },
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'gpt-5.4',
+        input: '/agents',
+        stream: false,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      object: 'response',
+      status: 'completed',
+      metadata: {
+        qrouter_local_command: true,
+        command_name: 'agents',
+        command_text: '/agents',
+      },
+      output: [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'output_text',
+              text: expect.stringContaining('/agents'),
+            },
+          ],
+        },
+      ],
+    });
+    expect(response.body).toContain('Q-router 已在本地拦截该命令');
+    expect(called).toBe(false);
+
+    await app.close();
+  });
+
   test('retries 403 usage-limit responses and returns the later semantic success', async () => {
     let attempts = 0;
     const app = buildApp({
@@ -261,7 +377,7 @@ describe('POST /v1/chat/completions', () => {
     await app.close();
   });
 
-  test('surfaces explicit failure when all attempts end as empty-success', async () => {
+  test('returns a visible assistant reply when all attempts end as empty-success', async () => {
     let attempts = 0;
     const app = buildApp({
       traceStore: createNoopTraceStore(),
@@ -298,16 +414,19 @@ describe('POST /v1/chat/completions', () => {
       },
     });
 
-    expect(response.statusCode).toBe(502);
-    expect(response.json()).toEqual({
-      error: {
-        message: 'Upstream response exhausted retries without semantic success.',
-        type: 'upstream_empty_success',
-        request_id: expect.any(String),
-        attempts: 2,
-        final_error_class: 'empty_success',
-      },
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      object: 'chat.completion',
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: expect.stringContaining('上游模型返回了空响应'),
+          },
+        },
+      ],
     });
+    expect((response.json() as { choices: Array<{ message: { content: string } }> }).choices[0].message.content).toContain('已自动重试 1 次后仍失败');
     expect(attempts).toBe(2);
 
     await app.close();
@@ -538,7 +657,7 @@ describe('POST /v1/chat/completions', () => {
     });
   });
 
-  test('returns explicit retry exhaustion for timeout failures and leaves enough diagnostics to explain the outcome', async () => {
+  test('returns a visible assistant reply for timeout failures after retry exhaustion and keeps diagnostics', async () => {
     let attempts = 0;
     const tempDir = mkdtempSync(join(tmpdir(), 'Q-router-timeout-exhausted-'));
     const jsonlPath = join(tempDir, 'events.jsonl');
@@ -568,15 +687,17 @@ describe('POST /v1/chat/completions', () => {
       },
     });
 
-    expect(response.statusCode).toBe(502);
-    expect(response.json()).toEqual({
-      error: {
-        message: 'Upstream request failed after retries.',
-        type: 'upstream_retry_exhausted',
-        request_id: expect.any(String),
-        attempts: 2,
-        final_error_class: 'timeout',
-      },
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      object: 'chat.completion',
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: expect.stringContaining('上游模型请求超时'),
+          },
+        },
+      ],
     });
     expect(attempts).toBe(2);
 
@@ -592,7 +713,8 @@ describe('POST /v1/chat/completions', () => {
         expect.objectContaining({ event: 'attempt_started', attempt: 1 }),
         expect.objectContaining({ event: 'attempt_started', attempt: 2 }),
         expect.objectContaining({ event: 'retry_scheduled', classification: 'timeout' }),
-        expect.objectContaining({ event: 'request_completed', classification: 'timeout', committed: false }),
+        expect.objectContaining({ event: 'visible_failure_returned', classification: 'timeout' }),
+        expect.objectContaining({ event: 'request_completed', classification: 'timeout', committed: true }),
       ]),
     );
 
@@ -611,9 +733,83 @@ describe('POST /v1/chat/completions', () => {
     expect(rows[0]).toEqual({
       attempts: 2,
       final_classification: 'timeout',
-      committed: 0,
+      committed: 1,
       error_class: 'timeout',
     });
+  });
+
+  test('returns a visible assistant reply after retry exhaustion on 429', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'Q-router-429-exhausted-'));
+    const jsonlPath = join(tempDir, 'events.jsonl');
+    const sqlitePath = join(tempDir, 'summaries.sqlite');
+    const traceStore = createTraceStore({ jsonlPath, sqlitePath });
+
+    let attempts = 0;
+    const app = buildApp({
+      traceStore,
+      fetchUpstream: async () => {
+        attempts += 1;
+        return {
+          status: 429,
+          headers: {},
+          providerId: 'codex',
+          upstreamUrl: 'https://codex.example.test/v1/responses',
+          json: async () => ({
+            error: {
+              type: 'rate_limit_error',
+              code: 'USAGE_LIMIT_EXCEEDED',
+              message: 'daily usage limit exceeded',
+            },
+          }),
+          bodyText: async () => JSON.stringify({
+            error: {
+              type: 'rate_limit_error',
+              code: 'USAGE_LIMIT_EXCEEDED',
+              message: 'daily usage limit exceeded',
+            },
+          }),
+        };
+      },
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-5.4',
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      object: 'chat.completion',
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: expect.stringContaining('已自动重试 3 次后仍失败'),
+          },
+        },
+      ],
+    });
+    expect(response.body).toContain('上游模型当前限流或额度已耗尽：daily usage limit exceeded');
+    expect(attempts).toBe(4);
+
+    await app.close();
+
+    const jsonl = readFileSync(jsonlPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    expect(jsonl).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ event: 'upstream_error', status: 429, retryable: true }),
+        expect.objectContaining({ event: 'retry_scheduled', classification: 'http_429' }),
+        expect.objectContaining({ event: 'visible_failure_returned', classification: 'http_429' }),
+        expect.objectContaining({ event: 'request_completed', classification: 'http_429', committed: true }),
+      ]),
+    );
   });
 
   test('surfaces parsed upstream error details for non-retryable terminal failures', async () => {
@@ -656,10 +852,10 @@ describe('POST /v1/chat/completions', () => {
     });
 
     expect(response.statusCode).toBe(403);
-    expect(response.json()).toEqual({
+    expect(response.json()).toMatchObject({
       error: {
-        message: 'Upstream 403: Plan does not allow this model',
         type: 'upstream_terminal_error',
+        message: 'Upstream 403: Plan does not allow this model',
         request_id: expect.any(String),
         attempts: 1,
         final_error_class: 'http_403',
@@ -668,7 +864,6 @@ describe('POST /v1/chat/completions', () => {
           type: 'forbidden',
           code: 'plan_forbidden',
           message: 'Plan does not allow this model',
-          body_snippet: expect.stringContaining('plan_forbidden'),
         },
       },
     });
@@ -696,6 +891,17 @@ describe('POST /v1/chat/completions', () => {
           upstreamErrorType: 'forbidden',
           upstreamErrorCode: 'plan_forbidden',
           upstreamErrorMessage: 'Plan does not allow this model',
+        }),
+        expect.objectContaining({
+          event: 'terminal_failure_returned',
+          classification: 'http_403',
+          upstreamStatus: 403,
+          upstreamErrorType: 'forbidden',
+        }),
+        expect.objectContaining({
+          event: 'request_completed',
+          classification: 'http_403',
+          committed: false,
         }),
       ]),
     );

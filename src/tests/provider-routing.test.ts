@@ -2,14 +2,18 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { chdir, cwd } from 'node:process';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { loadRouterRuntimeConfig } from '../config/router.js';
 import { resetRoutingState } from '../routing/routes.js';
 import { buildApp } from '../server.js';
+import { createTraceStore } from '../traces/store.js';
 
 const originalCwd = cwd();
 const envKeys = [
   'Q_ROUTER_CONFIG_PATH',
+  'Q_ROUTER_MAPPINGS_PATH',
+  'QINGFU_ROUTER_MAPPINGS_PATH',
   'Q_ROUTER_PORT',
   'Q_ROUTER_HOST',
   'Q_UPSTREAM_BASE_URL',
@@ -28,12 +32,15 @@ const modelScopePool = [
   'moonshotai/Kimi-K2.5',
 ] as const;
 
-function writeRouterConfig(config: unknown): string {
+function writeRouterConfig(config: unknown, mappings?: unknown): string {
   const dir = mkdtempSync(join(tmpdir(), 'Q-router-provider-'));
   const configDir = join(dir, 'config');
   mkdirSync(configDir, { recursive: true });
   const configPath = join(configDir, 'router.json');
   writeFileSync(configPath, JSON.stringify(config, null, 2));
+  if (mappings !== undefined) {
+    writeFileSync(join(configDir, 'model-mappings.json'), JSON.stringify(mappings, null, 2));
+  }
   return dir;
 }
 
@@ -240,6 +247,96 @@ describe('provider-aware upstream routing', () => {
     await app.close();
   });
 
+  test('uses config/model-mappings.json for provider routing when router.json omits routes', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        codex: {
+          api: 'openai-responses',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://codex.example.test/v1',
+          models: [
+            {
+              id: 'gpt-5.4',
+              name: 'GPT-5.4',
+            },
+          ],
+        },
+      },
+    }, {
+      routes: [
+        {
+          id: 'codex-main',
+          provider: 'codex',
+          aliases: ['LR/gpt-5.4', 'gpt-5.4', 'codex/gpt-5.4'],
+          model: 'gpt-5.4',
+        },
+      ],
+    });
+
+    chdir(dir);
+    process.env.Q_CODEX_API_KEY = 'codex-secret';
+
+    const fetchSpy = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      return new Response(
+        JSON.stringify({
+          id: 'resp-codex-mapping-file',
+          output: [
+            {
+              type: 'message',
+              role: 'assistant',
+              content: [
+                {
+                  type: 'output_text',
+                  text: 'hello from mapping file',
+                },
+              ],
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'LR/gpt-5.4',
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      id: 'resp-codex-mapping-file',
+      choices: [
+        {
+          message: {
+            content: 'hello from mapping file',
+          },
+        },
+      ],
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('https://codex.example.test/v1/responses');
+    expect(JSON.parse(String(init.body)).model).toBe('gpt-5.4');
+
+    await app.close();
+  });
+
   test('routes explicit route aliases through the configured provider without legacy models.allow', async () => {
     const dir = writeRouterConfig({
       providers: {
@@ -406,7 +503,7 @@ describe('provider-aware upstream routing', () => {
     await app.close();
   });
 
-  test('does not eagerly parse a non-JSON terminal error body from responses upstream', async () => {
+  test('returns a structured terminal error for a non-JSON upstream 401 without unhandled rejection', async () => {
     const dir = writeRouterConfig({
       providers: {
         codex: {
@@ -463,10 +560,10 @@ describe('provider-aware upstream routing', () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
 
       expect(response.statusCode).toBe(401);
-      expect(response.json()).toEqual({
+      expect(response.json()).toMatchObject({
         error: {
-          message: 'Upstream returned a non-retryable error.',
           type: 'upstream_terminal_error',
+          message: 'Upstream returned a non-retryable error.',
           request_id: expect.any(String),
           attempts: 1,
           final_error_class: 'http_401',
@@ -476,12 +573,90 @@ describe('provider-aware upstream routing', () => {
           },
         },
       });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
       expect(unhandled).toEqual([]);
 
       await app.close();
     } finally {
       process.off('unhandledRejection', onUnhandledRejection);
     }
+  });
+
+  test('returns a structured terminal error on /v1/responses 401', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        codex: {
+          api: 'openai-responses',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://codex.example.test/v1',
+          models: [
+            {
+              id: 'gpt-5.4',
+              name: 'GPT-5.4',
+            },
+          ],
+        },
+      },
+      models: {
+        allow: ['gpt-5.4'],
+      },
+    });
+
+    chdir(dir);
+    process.env.Q_CODEX_API_KEY = 'codex-secret';
+
+    const fetchSpy = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          error: {
+            type: 'invalid_api_key',
+            code: 'invalid_api_key',
+            message: 'Bad credentials',
+          },
+        }),
+        {
+          status: 401,
+          headers: {
+            'content-type': 'application/json',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'gpt-5.4',
+        input: 'hi',
+      },
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toMatchObject({
+      error: {
+        type: 'upstream_terminal_error',
+        message: 'Upstream 401: Bad credentials',
+        request_id: expect.any(String),
+        attempts: 1,
+        final_error_class: 'http_401',
+        upstream_status: 401,
+        upstream_error: {
+          type: 'invalid_api_key',
+          code: 'invalid_api_key',
+          message: 'Bad credentials',
+        },
+      },
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    await app.close();
   });
 
   test('encodes assistant history as output_text for codex responses input', async () => {
@@ -797,6 +972,7 @@ describe('provider-aware upstream routing', () => {
       models: {
         allow: ['gpt-5.4'],
       },
+    }, {
       thinking: {
         defaultMode: 'pass-through',
         mappings: [
@@ -1348,6 +1524,10 @@ describe('provider-aware upstream routing', () => {
   });
 
   test('proxies /v1/responses requests to codex upstream with model normalization', async () => {
+    const traceDir = mkdtempSync(join(tmpdir(), 'Q-router-provider-summary-'));
+    const sqlitePath = join(traceDir, 'summaries.sqlite');
+    const jsonlPath = join(traceDir, 'events.jsonl');
+    const traceStore = createTraceStore({ jsonlPath, sqlitePath });
     const dir = writeRouterConfig({
       providers: {
         codex: {
@@ -1390,6 +1570,7 @@ describe('provider-aware upstream routing', () => {
 
     const app = buildApp({
       routerConfig: loadRouterRuntimeConfig(),
+      traceStore,
     });
 
     const response = await app.inject({
@@ -1406,7 +1587,30 @@ describe('provider-aware upstream routing', () => {
     expect(response.json()).toMatchObject({
       id: 'resp-passthrough',
       object: 'response',
+      metadata: {
+        qrouter: {
+          endpoint: 'responses',
+          request_id: expect.any(String),
+          final_classification: 'semantic_success',
+          attempts: 1,
+          retries_used: 0,
+          requested_model: 'LR/gpt-5.4',
+          upstream_model: 'gpt-5.4',
+          provider_id: 'codex',
+          route_id: 'codex:gpt-5.4',
+          failover_used: false,
+        },
+      },
     });
+    expect(response.headers['x-qrouter-request-id']).toBeTruthy();
+    expect(response.headers['x-qrouter-endpoint']).toBe('responses');
+    expect(response.headers['x-qrouter-final-classification']).toBe('semantic_success');
+    expect(response.headers['x-qrouter-requested-model']).toBe('LR/gpt-5.4');
+    expect(response.headers['x-qrouter-upstream-model']).toBe('gpt-5.4');
+    expect(response.headers['x-qrouter-provider-id']).toBe('codex');
+    expect(response.headers['x-qrouter-route-id']).toBe('codex:gpt-5.4');
+    expect(response.headers['x-qrouter-retries-used']).toBe('0');
+    expect(response.headers['x-qrouter-failover-used']).toBe('false');
 
     const [url, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe('https://codex.example.test/v1/responses');
@@ -1418,6 +1622,42 @@ describe('provider-aware upstream routing', () => {
     });
 
     await app.close();
+
+    const db = new DatabaseSync(sqlitePath);
+    const rows = db
+      .prepare(`
+        SELECT
+          endpoint,
+          final_classification,
+          requested_model,
+          upstream_model,
+          provider_id,
+          route_id,
+          failover_used
+        FROM request_summaries
+      `)
+      .all() as Array<{
+      endpoint: string;
+      final_classification: string;
+      requested_model: string;
+      upstream_model: string;
+      provider_id: string;
+      route_id: string;
+      failover_used: number;
+    }>;
+    db.close();
+
+    expect(rows).toEqual([
+      {
+        endpoint: 'responses',
+        final_classification: 'semantic_success',
+        requested_model: 'LR/gpt-5.4',
+        upstream_model: 'gpt-5.4',
+        provider_id: 'codex',
+        route_id: 'codex:gpt-5.4',
+        failover_used: 0,
+      },
+    ]);
   });
 
   test('accepts bare model ids on /v1/responses when only the LR-prefixed allow entry exists', async () => {
@@ -1632,9 +1872,19 @@ describe('provider-aware upstream routing', () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.headers['content-type']).toContain('text/event-stream');
+    expect(response.headers['x-qrouter-endpoint']).toBe('responses');
+    expect(response.headers['x-qrouter-final-classification']).toBe('semantic_success');
+    expect(response.headers['x-qrouter-requested-model']).toBe('LR/gpt-5.4');
+    expect(response.headers['x-qrouter-upstream-model']).toBe('gpt-5.4');
     expect(response.body).toContain('data: {"type":"response.created"');
     expect(response.body).toContain('data: {"type":"response.output_text.delta"');
     expect(response.body).toContain('data: {"type":"response.completed"');
+    expect(response.body).toContain('"metadata":{"qrouter":{');
+    expect(response.body).toContain('"endpoint":"responses"');
+    expect(response.body).toContain('"requested_model":"LR/gpt-5.4"');
+    expect(response.body).toContain('"upstream_model":"gpt-5.4"');
+    expect(response.body).toContain('"provider_id":"codex"');
+    expect(response.body).toContain('"route_id":"codex:gpt-5.4"');
     expect(response.body).not.toContain('event: response.created');
     expect(response.body).not.toContain('\n:\n');
 
@@ -1856,6 +2106,10 @@ describe('provider-aware upstream routing', () => {
   });
 
   test('retries LR/ms on the same backend before switching the sticky active model', async () => {
+    const traceDir = mkdtempSync(join(tmpdir(), 'Q-router-failover-summary-'));
+    const sqlitePath = join(traceDir, 'summaries.sqlite');
+    const jsonlPath = join(traceDir, 'events.jsonl');
+    const traceStore = createTraceStore({ jsonlPath, sqlitePath });
     const dir = writeRouterConfig({
       providers: {
         modelscope: {
@@ -1920,6 +2174,7 @@ describe('provider-aware upstream routing', () => {
 
     const app = buildApp({
       routerConfig: loadRouterRuntimeConfig(),
+      traceStore,
       retryPolicy: {
         maxAttempts: 3,
         backoffMs: () => 0,
@@ -1935,7 +2190,18 @@ describe('provider-aware upstream routing', () => {
       },
     });
 
-    expect(failedResponse.statusCode).toBe(502);
+    expect(failedResponse.statusCode).toBe(200);
+    expect(failedResponse.json()).toMatchObject({
+      object: 'chat.completion',
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: expect.stringContaining('请稍后重试'),
+          },
+        },
+      ],
+    });
 
     const recoveredResponse = await app.inject({
       method: 'POST',
@@ -1953,11 +2219,24 @@ describe('provider-aware upstream routing', () => {
         {
           message: {
             role: 'assistant',
-            content: 'recovered via next modelscope backend',
+            content: expect.stringContaining('recovered via next modelscope backend'),
           },
         },
       ],
     });
+    expect(recoveredResponse.body).toContain('[Q-router 提示]');
+    expect(recoveredResponse.body).toContain(`候选模型：${modelScopePool[1]}`);
+    expect(recoveredResponse.headers['x-qrouter-request-id']).toBeTruthy();
+    expect(recoveredResponse.headers['x-qrouter-endpoint']).toBe('chat.completions');
+    expect(recoveredResponse.headers['x-qrouter-final-classification']).toBe('semantic_success');
+    expect(recoveredResponse.headers['x-qrouter-requested-model']).toBe('LR/ms');
+    expect(recoveredResponse.headers['x-qrouter-upstream-model']).toBe(modelScopePool[1]);
+    expect(recoveredResponse.headers['x-qrouter-provider-id']).toBe('modelscope');
+    expect(recoveredResponse.headers['x-qrouter-route-id']).toBe('legacy:modelscope:ms');
+    expect(recoveredResponse.headers['x-qrouter-retries-used']).toBe('0');
+    expect(recoveredResponse.headers['x-qrouter-failover-used']).toBe('true');
+    expect(recoveredResponse.headers['x-qrouter-failover-from']).toBe(modelScopePool[0]);
+    expect(recoveredResponse.headers['x-qrouter-failover-to']).toBe(modelScopePool[1]);
 
     expect(fetchSpy).toHaveBeenCalledTimes(4);
 
@@ -1971,6 +2250,271 @@ describe('provider-aware upstream routing', () => {
       modelScopePool[0],
     ]);
     expect(routedModels[3]).toBe(modelScopePool[1]);
+
+    const statsResponse = await app.inject({
+      method: 'GET',
+      url: '/stats/requests?provider_id=modelscope&route_id=legacy:modelscope:ms&failover_used=1&limit=5',
+    });
+
+    expect(statsResponse.statusCode).toBe(200);
+    expect(statsResponse.json()).toMatchObject({
+      items: [
+        {
+          endpoint: 'chat.completions',
+          finalClassification: 'semantic_success',
+          requestedModel: 'LR/ms',
+          upstreamModel: modelScopePool[1],
+          providerId: 'modelscope',
+          routeId: 'legacy:modelscope:ms',
+          failoverUsed: true,
+          failoverFrom: modelScopePool[0],
+          failoverTo: modelScopePool[1],
+        },
+      ],
+    });
+
+    const noFailoverStatsResponse = await app.inject({
+      method: 'GET',
+      url: '/stats/requests?provider_id=modelscope&route_id=legacy:modelscope:ms&failover_used=0&limit=5',
+    });
+
+    expect(noFailoverStatsResponse.statusCode).toBe(200);
+    expect(noFailoverStatsResponse.json()).toMatchObject({
+      items: [
+        {
+          endpoint: 'chat.completions',
+          finalClassification: 'http_403',
+          requestedModel: 'LR/ms',
+          upstreamModel: modelScopePool[0],
+          providerId: 'modelscope',
+          routeId: 'legacy:modelscope:ms',
+          failoverUsed: false,
+        },
+      ],
+    });
+
+    const aggregateStatsResponse = await app.inject({
+      method: 'GET',
+      url: '/stats/requests/aggregate?provider_id=modelscope&route_id=legacy:modelscope:ms&limit=5',
+    });
+
+    expect(aggregateStatsResponse.statusCode).toBe(200);
+    expect(aggregateStatsResponse.json()).toMatchObject({
+      items: [
+        {
+          endpoint: 'chat.completions',
+          providerId: 'modelscope',
+          routeId: 'legacy:modelscope:ms',
+          failoverUsed: true,
+          finalClassification: 'semantic_success',
+          requestCount: 1,
+        },
+        {
+          endpoint: 'chat.completions',
+          providerId: 'modelscope',
+          routeId: 'legacy:modelscope:ms',
+          failoverUsed: false,
+          finalClassification: 'http_403',
+          requestCount: 1,
+        },
+      ],
+    });
+
+    const routeHealthResponse = await app.inject({
+      method: 'GET',
+      url: '/stats/routes/health?provider_id=modelscope&route_id=legacy:modelscope:ms&limit=5',
+    });
+
+    expect(routeHealthResponse.statusCode).toBe(200);
+    expect(routeHealthResponse.json()).toMatchObject({
+      items: [
+        {
+          endpoint: 'chat.completions',
+          providerId: 'modelscope',
+          routeId: 'legacy:modelscope:ms',
+          totalRequests: 2,
+          successRequests: 1,
+          failedRequests: 1,
+          failoverRequests: 1,
+          failureRate: 0.5,
+          failoverHitRate: 0.5,
+          latestErrorClassification: 'http_403',
+          status: 'degraded',
+          latestRequestAt: expect.any(String),
+          latestSuccessAt: expect.any(String),
+          latestFailureAt: expect.any(String),
+        },
+      ],
+    });
+
+    await app.close();
+
+    const db = new DatabaseSync(sqlitePath);
+    const rows = db
+      .prepare(`
+        SELECT
+          endpoint,
+          final_classification,
+          requested_model,
+          upstream_model,
+          provider_id,
+          route_id,
+          failover_used,
+          failover_from,
+          failover_to
+        FROM request_summaries
+        WHERE final_classification = 'semantic_success'
+        ORDER BY created_at ASC
+      `)
+      .all() as Array<{
+      endpoint: string;
+      final_classification: string;
+      requested_model: string;
+      upstream_model: string;
+      provider_id: string;
+      route_id: string;
+      failover_used: number;
+      failover_from: string | null;
+      failover_to: string | null;
+    }>;
+    db.close();
+
+    expect(rows).toEqual([
+      {
+        endpoint: 'chat.completions',
+        final_classification: 'semantic_success',
+        requested_model: 'LR/ms',
+        upstream_model: modelScopePool[1],
+        provider_id: 'modelscope',
+        route_id: 'legacy:modelscope:ms',
+        failover_used: 1,
+        failover_from: modelScopePool[0],
+        failover_to: modelScopePool[1],
+      },
+    ]);
+  });
+
+  test('appends a failover notice to streaming replies when sticky-failover is serving a candidate model', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        modelscope: {
+          api: 'openai-completions',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://modelscope.example.test/v1',
+          models: modelScopePool.map((id) => ({
+            id,
+            name: id,
+          })),
+        },
+      },
+      models: {
+        allow: ['LR/ms'],
+      },
+    });
+
+    chdir(dir);
+    process.env.Q_MODELSCOPE_API_KEY = 'ms-secret';
+
+    const encoder = new TextEncoder();
+    const fetchSpy = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { model?: string };
+      if (body.model === modelScopePool[0]) {
+        return new Response(
+          JSON.stringify({
+            error: {
+              type: 'usage_limit_reached',
+              message: 'The usage limit has been reached',
+            },
+          }),
+          {
+            status: 403,
+            headers: {
+              'content-type': 'application/json',
+            },
+          },
+        );
+      }
+
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+              id: 'resp-modelscope-stream',
+              object: 'chat.completion.chunk',
+              model: body.model,
+              choices: [
+                {
+                  index: 0,
+                  delta: {
+                    role: 'assistant',
+                    content: 'stream recovered via next modelscope backend',
+                  },
+                },
+              ],
+            })}\n\n`));
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+              id: 'resp-modelscope-stream',
+              object: 'chat.completion.chunk',
+              model: body.model,
+              choices: [
+                {
+                  index: 0,
+                  delta: {},
+                  finish_reason: 'stop',
+                },
+              ],
+            })}\n\n`));
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+            controller.close();
+          },
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'text/event-stream',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+      retryPolicy: {
+        maxAttempts: 2,
+        backoffMs: () => 0,
+      },
+    });
+
+    const failedResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'LR/ms',
+        messages: [{ role: 'user', content: 'trip breaker first' }],
+      },
+    });
+
+    expect(failedResponse.statusCode).toBe(200);
+    expect(failedResponse.body).toContain('请稍后重试');
+
+    const streamedResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'LR/ms',
+        stream: true,
+        messages: [{ role: 'user', content: 'now use candidate' }],
+      },
+    });
+
+    expect(streamedResponse.statusCode).toBe(200);
+    expect(streamedResponse.headers['content-type']).toContain('text/event-stream');
+    expect(streamedResponse.body).toContain('stream recovered via next modelscope backend');
+    expect(streamedResponse.body).toContain('[Q-router 提示]');
+    expect(streamedResponse.body).toContain(`候选模型：${modelScopePool[1]}`);
+    expect(streamedResponse.body).toContain('[DONE]');
 
     await app.close();
   });
@@ -2113,6 +2657,85 @@ describe('provider-aware upstream routing', () => {
     expect((response.json() as { error: { estimated_input_tokens: number } }).error.estimated_input_tokens).toBeGreaterThan(10);
     expect(fetchSpy).not.toHaveBeenCalled();
 
+    await app.close();
+  });
+
+  test('returns a visible reply on /v1/responses 429 after retries', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        codex: {
+          api: 'openai-responses',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://codex.example.test/v1',
+          models: [
+            {
+              id: 'gpt-5.4',
+              name: 'GPT-5.4',
+            },
+          ],
+        },
+      },
+      models: {
+        allow: ['LR/gpt-5.4', 'gpt-5.4'],
+      },
+    });
+
+    chdir(dir);
+    process.env.Q_CODEX_API_KEY = 'codex-secret';
+
+    const fetchSpy = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          error: {
+            type: 'rate_limit_error',
+            code: 'USAGE_LIMIT_EXCEEDED',
+            message: 'daily usage limit exceeded',
+          },
+        }),
+        {
+          status: 429,
+          headers: {
+            'content-type': 'application/json',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'LR/gpt-5.4',
+        input: 'hi',
+        stream: false,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      object: 'response',
+      status: 'completed',
+      output: [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'output_text',
+              text: expect.stringContaining('已自动重试 3 次后仍失败'),
+            },
+          ],
+        },
+      ],
+    });
+    expect(response.body).toContain('上游模型当前限流或额度已耗尽：daily usage limit exceeded');
+
+    expect(fetchSpy).toHaveBeenCalledTimes(4);
     await app.close();
   });
 

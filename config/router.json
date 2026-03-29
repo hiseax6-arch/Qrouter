@@ -91,32 +91,6 @@
       "apiKey": "ms-5d1ce597-46b2-478b-8b7a-70f44a0cf0c5"
     }
   },
-  "models": {
-    "allow": [
-      "LR/stepfun/step-3.5-flash:free",
-      "stepfun/step-3.5-flash:free",
-      "arcee-ai/trinity-large-preview:free",
-      "codex/gpt-5.4",
-      "gpt-5.4",
-      "LR/gpt-5.4",
-      "MiniMax/MiniMax-M2.5",
-      "ZhipuAI/GLM-5",
-      "Qwen/Qwen3-235B-A22B",
-      "moonshotai/Kimi-K2.5",
-      "LR/ms"
-    ]
-  },
-  "thinking": {
-    "defaultMode": "pass-through",
-    "mappingsEnabled": false,
-    "mappings": [
-      {
-        "match": ["LR/gpt-5.4", "gpt-5.4"],
-        "when": { "thinking": "low" },
-        "rewrite": { "reasoning": { "effort": "xhigh" } }
-      }
-    ]
-  },
   "traces": {
     "dir": ".qingfu-router"
   }

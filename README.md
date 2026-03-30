@@ -1,5 +1,7 @@
 # Q-router
 
+[English](./README.md) | [简体中文](./README.zh-CN.md) | [繁體中文](./README.zh-TW.md)
+
 Q-router is a local OpenAI-compatible gateway for OpenClaw. It sits between OpenClaw and upstream providers, keeps model routing explicit, and prevents empty or malformed upstream "success" payloads from being returned as normal completions.
 
 ## What It Does

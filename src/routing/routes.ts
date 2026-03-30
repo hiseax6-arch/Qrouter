@@ -13,9 +13,11 @@ export type CompiledRoute = {
   source: 'explicit' | 'legacy';
   providerId: string;
   aliases: string[];
+  fallbackAliases?: string[];
   strategy: 'direct' | 'round-robin' | 'sticky-failover';
   upstreamModel?: string;
   members?: string[];
+  failbackAfterMs?: number;
 };
 
 export type CompiledRoutingTable = {
@@ -36,8 +38,10 @@ export type RoundRobinRouteSelection = {
   memberIndex: number;
 };
 
+const DEFAULT_STICKY_FAILBACK_AFTER_MS = 300_000;
+
 const roundRobinRouteOffsets = new Map<string, number>();
-const stickyFailoverRouteOffsets = new Map<string, number>();
+const stickyFailoverRouteOffsets = new Map<string, { memberIndex: number; changedAt: number }>();
 
 function stripLrPrefix(model: string): string {
   return model.startsWith('LR/') ? model.slice(3) : model;
@@ -67,6 +71,31 @@ function uniqueStrings(values: Array<string | undefined | null>): string[] {
   return items;
 }
 
+function defaultRouteFallbackAlias(route: CompiledRoute): string | null {
+  return route.aliases[0] ?? null;
+}
+
+function withDefaultFallbackAliases(routes: CompiledRoute[]): CompiledRoute[] {
+  const canonicalAliases = routes.map((route) => ({
+    routeId: route.id,
+    alias: defaultRouteFallbackAlias(route),
+  }));
+
+  return routes.map((route) => {
+    const automaticFallbacks = canonicalAliases
+      .filter((candidate) => candidate.routeId !== route.id)
+      .map((candidate) => candidate.alias);
+
+    return {
+      ...route,
+      fallbackAliases: uniqueStrings([
+        ...(route.fallbackAliases ?? []),
+        ...automaticFallbacks,
+      ]).filter((alias) => !route.aliases.includes(alias)),
+    };
+  });
+}
+
 function defaultExplicitRouteId(route: RouterRouteConfig, index: number): string {
   if (route.id) {
     return route.id;
@@ -93,8 +122,10 @@ function buildExplicitRoute(route: RouterRouteConfig, index: number): CompiledRo
       source: 'explicit',
       providerId: route.provider,
       aliases: uniqueStrings(route.aliases ?? []),
+      fallbackAliases: uniqueStrings(route.fallbacks ?? []),
       strategy,
       members: uniqueStrings((route.members ?? []).map((member) => stripProviderPrefix(member, route.provider))),
+      ...(typeof route.failbackAfterMs === 'number' ? { failbackAfterMs: route.failbackAfterMs } : {}),
     };
   }
 
@@ -107,8 +138,10 @@ function buildExplicitRoute(route: RouterRouteConfig, index: number): CompiledRo
       model,
       model ? withProviderPrefix(route.provider, model) : undefined,
     ]),
+    fallbackAliases: uniqueStrings(route.fallbacks ?? []),
     strategy,
     upstreamModel: model,
+    ...(typeof route.failbackAfterMs === 'number' ? { failbackAfterMs: route.failbackAfterMs } : {}),
   };
 }
 
@@ -143,6 +176,7 @@ function buildLegacyRoutes(
           withProviderPrefix(providerId, upstreamModel),
           ...allowAliases,
         ]),
+        fallbackAliases: [],
         strategy: 'direct',
         upstreamModel,
       });
@@ -159,6 +193,7 @@ function buildLegacyRoutes(
         source: 'legacy',
         providerId: 'modelscope',
         aliases: [...LEGACY_MODELSCOPE_ROUTE_ALIASES],
+        fallbackAliases: [],
         strategy: 'sticky-failover',
         members: [...members],
       });
@@ -171,10 +206,11 @@ function buildLegacyRoutes(
 export function compileRoutingTable(config: Pick<RouterRuntimeConfig, 'providers' | 'routes' | 'models'>): CompiledRoutingTable {
   const explicitRoutes = config.routes ?? [];
   const warnings: string[] = [];
-  const routes =
+  const routes = withDefaultFallbackAliases(
     explicitRoutes.length > 0
       ? explicitRoutes.map((route, index) => buildExplicitRoute(route, index))
-      : buildLegacyRoutes(config.providers, config.models.allow);
+      : buildLegacyRoutes(config.providers, config.models.allow),
+  );
 
   const aliasOwners = new Map<string, string[]>();
   for (const route of routes) {
@@ -271,8 +307,23 @@ export function selectStickyFailoverRoute(
     return null;
   }
 
-  const currentOffset = stickyFailoverRouteOffsets.get(route.id) ?? 0;
-  const memberIndex = currentOffset % route.members.length;
+  const state = stickyFailoverRouteOffsets.get(route.id);
+  const failbackAfterMs = route.failbackAfterMs ?? DEFAULT_STICKY_FAILBACK_AFTER_MS;
+  const shouldFailback =
+    !!state
+    && state.memberIndex !== 0
+    && failbackAfterMs >= 0
+    && (Date.now() - state.changedAt) >= failbackAfterMs;
+  const memberIndex = shouldFailback
+    ? 0
+    : (state?.memberIndex ?? 0) % route.members.length;
+
+  if (shouldFailback) {
+    stickyFailoverRouteOffsets.set(route.id, {
+      memberIndex: 0,
+      changedAt: Date.now(),
+    });
+  }
 
   return {
     route,
@@ -308,7 +359,10 @@ export function advanceStickyFailoverRoute(
   }
 
   const memberIndex = (currentMemberIndex + 1) % route.members.length;
-  stickyFailoverRouteOffsets.set(route.id, memberIndex);
+  stickyFailoverRouteOffsets.set(route.id, {
+    memberIndex,
+    changedAt: Date.now(),
+  });
 
   return {
     route,
@@ -316,6 +370,20 @@ export function advanceStickyFailoverRoute(
     upstreamModel: route.members[memberIndex],
     memberIndex,
   };
+}
+
+export function setStickyFailoverRouteMember(
+  route: CompiledRoute,
+  memberIndex: number,
+): void {
+  if (route.strategy !== 'sticky-failover' || !route.members || route.members.length === 0) {
+    return;
+  }
+
+  stickyFailoverRouteOffsets.set(route.id, {
+    memberIndex: memberIndex % route.members.length,
+    changedAt: Date.now(),
+  });
 }
 
 export function resetRoutingState(): void {

@@ -8,6 +8,7 @@ type VisibleFailureArgs = {
   finalErrorClass: string;
   upstreamStatus?: number | null;
   upstreamError?: UpstreamFailureDetails | null;
+  fallbackChainExhausted?: boolean;
 };
 
 function resolveVisibleModel(model: string | null | undefined): string {
@@ -57,6 +58,9 @@ function resolveVisibleReason(args: VisibleFailureArgs): string {
 function buildVisibleMessage(args: VisibleFailureArgs): string {
   const reason = resolveVisibleReason(args);
   const retriesUsed = Math.max(args.attempts - 1, 0);
+  if (args.fallbackChainExhausted) {
+    return `${reason}，已依次重试并轮询模型库后仍失败，当前没有可连通模型。请求号：${args.requestId}`;
+  }
   const retryPhrase = retriesUsed > 0 ? `已自动重试 ${retriesUsed} 次后仍失败。` : '本次请求未成功。';
   return `${reason}，${retryPhrase}请稍后重试，或切换到备用模型。请求号：${args.requestId}`;
 }

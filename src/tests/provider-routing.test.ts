@@ -1726,7 +1726,7 @@ describe('provider-aware upstream routing', () => {
     await app.close();
   });
 
-  test('uses sticky-failover routes on /v1/responses after the active member fails', async () => {
+  test('uses sticky-failover routes on /v1/responses within the same request after the active member exhausts its retries', async () => {
     const dir = writeRouterConfig({
       providers: {
         codex: {
@@ -1815,27 +1815,12 @@ describe('provider-aware upstream routing', () => {
       },
     });
 
-    const failedResponse = await app.inject({
-      method: 'POST',
-      url: '/v1/responses',
-      payload: {
-        model: 'LR/codex-failover',
-        input: 'hi',
-      },
-    });
-
-    expect(failedResponse.statusCode).toBe(200);
-    expect(failedResponse.json()).toMatchObject({
-      object: 'response',
-      status: 'completed',
-    });
-
     const recoveredResponse = await app.inject({
       method: 'POST',
       url: '/v1/responses',
       payload: {
         model: 'LR/codex-failover',
-        input: 'try secondary',
+        input: 'hi',
       },
     });
 
@@ -1872,6 +1857,7 @@ describe('provider-aware upstream routing', () => {
     expect(recoveredResponse.headers['x-qrouter-failover-from']).toBe('gpt-5.4');
     expect(recoveredResponse.headers['x-qrouter-failover-to']).toBe('gpt-5.4-mini');
 
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
     const routedModels = fetchSpy.mock.calls.map((call) => {
       const [, init] = call as unknown as [string, RequestInit];
       return JSON.parse(String(init.body)).model as string;
@@ -2264,7 +2250,7 @@ describe('provider-aware upstream routing', () => {
     await app.close();
   });
 
-  test('retries LR/ms on the same backend before switching the sticky active model', async () => {
+  test('retries LR/ms on the same backend before switching to the next sticky candidate within the same request', async () => {
     const traceDir = mkdtempSync(join(tmpdir(), 'Q-router-failover-summary-'));
     const sqlitePath = join(traceDir, 'summaries.sqlite');
     const jsonlPath = join(traceDir, 'events.jsonl');
@@ -2340,34 +2326,12 @@ describe('provider-aware upstream routing', () => {
       },
     });
 
-    const failedResponse = await app.inject({
-      method: 'POST',
-      url: '/v1/chat/completions',
-      payload: {
-        model: 'LR/ms',
-        messages: [{ role: 'user', content: 'hi' }],
-      },
-    });
-
-    expect(failedResponse.statusCode).toBe(200);
-    expect(failedResponse.json()).toMatchObject({
-      object: 'chat.completion',
-      choices: [
-        {
-          message: {
-            role: 'assistant',
-            content: expect.stringContaining('请稍后重试'),
-          },
-        },
-      ],
-    });
-
     const recoveredResponse = await app.inject({
       method: 'POST',
       url: '/v1/chat/completions',
       payload: {
         model: 'LR/ms',
-        messages: [{ role: 'user', content: 'try next backend' }],
+        messages: [{ role: 'user', content: 'hi' }],
       },
     });
 
@@ -2392,7 +2356,7 @@ describe('provider-aware upstream routing', () => {
     expect(recoveredResponse.headers['x-qrouter-upstream-model']).toBe(modelScopePool[1]);
     expect(recoveredResponse.headers['x-qrouter-provider-id']).toBe('modelscope');
     expect(recoveredResponse.headers['x-qrouter-route-id']).toBe('legacy:modelscope:ms');
-    expect(recoveredResponse.headers['x-qrouter-retries-used']).toBe('0');
+    expect(recoveredResponse.headers['x-qrouter-retries-used']).toBe('3');
     expect(recoveredResponse.headers['x-qrouter-failover-used']).toBe('true');
     expect(recoveredResponse.headers['x-qrouter-failover-from']).toBe(modelScopePool[0]);
     expect(recoveredResponse.headers['x-qrouter-failover-to']).toBe(modelScopePool[1]);
@@ -2438,19 +2402,7 @@ describe('provider-aware upstream routing', () => {
     });
 
     expect(noFailoverStatsResponse.statusCode).toBe(200);
-    expect(noFailoverStatsResponse.json()).toMatchObject({
-      items: [
-        {
-          endpoint: 'chat.completions',
-          finalClassification: 'http_403',
-          requestedModel: 'LR/ms',
-          upstreamModel: modelScopePool[0],
-          providerId: 'modelscope',
-          routeId: 'legacy:modelscope:ms',
-          failoverUsed: false,
-        },
-      ],
-    });
+    expect(noFailoverStatsResponse.json()).toMatchObject({ items: [] });
 
     const aggregateStatsResponse = await app.inject({
       method: 'GET',
@@ -2468,14 +2420,6 @@ describe('provider-aware upstream routing', () => {
           finalClassification: 'semantic_success',
           requestCount: 1,
         },
-        {
-          endpoint: 'chat.completions',
-          providerId: 'modelscope',
-          routeId: 'legacy:modelscope:ms',
-          failoverUsed: false,
-          finalClassification: 'http_403',
-          requestCount: 1,
-        },
       ],
     });
 
@@ -2491,17 +2435,17 @@ describe('provider-aware upstream routing', () => {
           endpoint: 'chat.completions',
           providerId: 'modelscope',
           routeId: 'legacy:modelscope:ms',
-          totalRequests: 2,
+          totalRequests: 1,
           successRequests: 1,
-          failedRequests: 1,
+          failedRequests: 0,
           failoverRequests: 1,
-          failureRate: 0.5,
-          failoverHitRate: 0.5,
-          latestErrorClassification: 'http_403',
+          failureRate: 0,
+          failoverHitRate: 1,
+          latestErrorClassification: null,
           status: 'degraded',
           latestRequestAt: expect.any(String),
           latestSuccessAt: expect.any(String),
-          latestFailureAt: expect.any(String),
+          latestFailureAt: null,
         },
       ],
     });
@@ -2553,7 +2497,712 @@ describe('provider-aware upstream routing', () => {
     ]);
   });
 
-  test('appends a failover notice to streaming replies when sticky-failover is serving a candidate model', async () => {
+  test('switches LR/gpt-5.4 to LR/ms after three retryable failures and appends the actual model notice', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        codex: {
+          api: 'openai-responses',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://codex.example.test/v1',
+          models: [
+            {
+              id: 'gpt-5.4',
+              name: 'GPT-5.4',
+            },
+          ],
+        },
+        modelscope: {
+          api: 'openai-completions',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://modelscope.example.test/v1',
+          models: modelScopePool.map((id) => ({
+            id,
+            name: id,
+          })),
+        },
+      },
+    }, {
+      routes: [
+        {
+          id: 'codex-main',
+          provider: 'codex',
+          aliases: ['LR/gpt-5.4', 'gpt-5.4', 'codex/gpt-5.4'],
+          fallbacks: ['LR/ms'],
+          model: 'gpt-5.4',
+        },
+        {
+          id: 'modelscope-ms-pool',
+          provider: 'modelscope',
+          strategy: 'sticky-failover',
+          aliases: ['LR/ms', 'ms'],
+          members: [...modelScopePool],
+        },
+      ],
+    });
+
+    chdir(dir);
+    process.env.Q_CODEX_API_KEY = 'codex-secret';
+    process.env.Q_MODELSCOPE_API_KEY = 'ms-secret';
+
+    const fetchSpy = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const body = JSON.parse(String(init?.body ?? '{}')) as { model?: string };
+
+      if (url.endsWith('/responses')) {
+        return new Response(
+          JSON.stringify({
+            error: {
+              type: 'server_error',
+              message: 'primary backend unavailable',
+            },
+          }),
+          {
+            status: 504,
+            headers: {
+              'content-type': 'application/json',
+            },
+          },
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          id: 'resp-modelscope-fallback',
+          choices: [
+            {
+              message: {
+                role: 'assistant',
+                content: `recovered via ${body.model}`,
+              },
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'LR/gpt-5.4',
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      id: 'resp-modelscope-fallback',
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: expect.stringContaining(`recovered via ${modelScopePool[0]}`),
+          },
+        },
+      ],
+    });
+    expect(response.body).toContain('[Q-router 提示]');
+    expect(response.body).toContain(`候选模型：${modelScopePool[0]}`);
+    expect(response.headers['x-qrouter-route-id']).toBe('modelscope-ms-pool');
+    expect(response.headers['x-qrouter-upstream-model']).toBe(modelScopePool[0]);
+    expect(response.headers['x-qrouter-failover-used']).toBe('true');
+    expect(response.headers['x-qrouter-failover-from']).toBe('gpt-5.4');
+    expect(response.headers['x-qrouter-failover-to']).toBe(modelScopePool[0]);
+
+    const routedModels = fetchSpy.mock.calls.map((call) => {
+      const [, init] = call as unknown as [string, RequestInit];
+      return JSON.parse(String(init.body)).model as string;
+    });
+    expect(routedModels).toEqual([
+      'gpt-5.4',
+      'gpt-5.4',
+      'gpt-5.4',
+      'gpt-5.4',
+      modelScopePool[0],
+    ]);
+
+    await app.close();
+  });
+
+  test('honors request-level no-fallback and keeps retrying only the originally requested model', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        codex: {
+          api: 'openai-responses',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://codex.example.test/v1',
+          models: [
+            {
+              id: 'gpt-5.4',
+              name: 'GPT-5.4',
+            },
+          ],
+        },
+        openrouter: {
+          api: 'openai-completions',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://openrouter.example.test/v1',
+          models: [
+            {
+              id: 'stepfun/step-3.5-flash:free',
+              name: 'step3fresh',
+            },
+          ],
+        },
+      },
+    }, {
+      routes: [
+        {
+          id: 'openrouter-stepfun',
+          provider: 'openrouter',
+          aliases: ['LR/stepfun/step-3.5-flash:free'],
+          model: 'stepfun/step-3.5-flash:free',
+        },
+        {
+          id: 'codex-main',
+          provider: 'codex',
+          aliases: ['LR/gpt-5.4'],
+          fallbacks: ['LR/stepfun/step-3.5-flash:free'],
+          model: 'gpt-5.4',
+        },
+      ],
+    });
+
+    chdir(dir);
+    process.env.Q_CODEX_API_KEY = 'codex-secret';
+    process.env.Q_OPENROUTER_API_KEY = 'openrouter-secret';
+
+    const fetchSpy = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          error: {
+            type: 'server_error',
+            message: 'primary backend unavailable',
+          },
+        }),
+        {
+          status: 503,
+          headers: {
+            'content-type': 'application/json',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+      retryPolicy: {
+        maxAttempts: 2,
+        backoffMs: () => 0,
+      },
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: {
+        'x-qrouter-no-fallback': 'true',
+      },
+      payload: {
+        model: 'LR/gpt-5.4',
+        qrouter: {
+          noFallback: true,
+        },
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain('请稍后重试');
+    expect(response.headers['x-qrouter-failover-used']).toBe('false');
+
+    const routedModels = fetchSpy.mock.calls.map((call) => {
+      const [, init] = call as unknown as [string, RequestInit];
+      return JSON.parse(String(init.body)).model as string;
+    });
+    expect(routedModels).toEqual(['gpt-5.4', 'gpt-5.4']);
+
+    const routedBodies = fetchSpy.mock.calls.map((call) => {
+      const [, init] = call as unknown as [string, RequestInit];
+      return JSON.parse(String(init.body)) as Record<string, unknown>;
+    });
+    expect(routedBodies.every((body) => body.qrouter === undefined)).toBe(true);
+
+    await app.close();
+  });
+
+  test('prefers stepfun as the first fallback alias for LR/gpt-5.4 after three retryable failures', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        codex: {
+          api: 'openai-responses',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://codex.example.test/v1',
+          models: [
+            {
+              id: 'gpt-5.4',
+              name: 'GPT-5.4',
+            },
+          ],
+        },
+        openrouter: {
+          api: 'openai-completions',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://openrouter.example.test/v1',
+          models: [
+            {
+              id: 'stepfun/step-3.5-flash:free',
+              name: 'step3fresh',
+            },
+          ],
+        },
+        modelscope: {
+          api: 'openai-completions',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://modelscope.example.test/v1',
+          models: modelScopePool.map((id) => ({
+            id,
+            name: id,
+          })),
+        },
+      },
+    }, {
+      routes: [
+        {
+          id: 'openrouter-stepfun',
+          provider: 'openrouter',
+          aliases: [
+            'LR/stepfun/step-3.5-flash:free',
+            'stepfun/step-3.5-flash:free',
+            'openrouter/stepfun/step-3.5-flash:free',
+          ],
+          model: 'stepfun/step-3.5-flash:free',
+        },
+        {
+          id: 'codex-main',
+          provider: 'codex',
+          aliases: ['LR/gpt-5.4', 'gpt-5.4', 'codex/gpt-5.4'],
+          fallbacks: ['LR/stepfun/step-3.5-flash:free', 'LR/ms'],
+          model: 'gpt-5.4',
+        },
+        {
+          id: 'modelscope-ms-pool',
+          provider: 'modelscope',
+          strategy: 'sticky-failover',
+          aliases: ['LR/ms', 'ms'],
+          members: [...modelScopePool],
+        },
+      ],
+    });
+
+    chdir(dir);
+    process.env.Q_CODEX_API_KEY = 'codex-secret';
+    process.env.Q_OPENROUTER_API_KEY = 'openrouter-secret';
+    process.env.Q_MODELSCOPE_API_KEY = 'ms-secret';
+
+    const fetchSpy = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const body = JSON.parse(String(init?.body ?? '{}')) as { model?: string };
+
+      if (url.endsWith('/responses')) {
+        return new Response(
+          JSON.stringify({
+            error: {
+              type: 'server_error',
+              message: 'primary backend unavailable',
+            },
+          }),
+          {
+            status: 504,
+            headers: {
+              'content-type': 'application/json',
+            },
+          },
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          id: 'resp-stepfun-fallback',
+          choices: [
+            {
+              message: {
+                role: 'assistant',
+                content: `recovered via ${body.model}`,
+              },
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'LR/gpt-5.4',
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      id: 'resp-stepfun-fallback',
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: expect.stringContaining('recovered via stepfun/step-3.5-flash:free'),
+          },
+        },
+      ],
+    });
+    expect(response.body).toContain('[Q-router 提示]');
+    expect(response.body).toContain('候选模型：stepfun/step-3.5-flash:free');
+    expect(response.headers['x-qrouter-route-id']).toBe('openrouter-stepfun');
+    expect(response.headers['x-qrouter-upstream-model']).toBe('stepfun/step-3.5-flash:free');
+    expect(response.headers['x-qrouter-failover-used']).toBe('true');
+    expect(response.headers['x-qrouter-failover-from']).toBe('gpt-5.4');
+    expect(response.headers['x-qrouter-failover-to']).toBe('stepfun/step-3.5-flash:free');
+
+    const routedModels = fetchSpy.mock.calls.map((call) => {
+      const [, init] = call as unknown as [string, RequestInit];
+      return JSON.parse(String(init.body)).model as string;
+    });
+    expect(routedModels).toEqual([
+      'gpt-5.4',
+      'gpt-5.4',
+      'gpt-5.4',
+      'gpt-5.4',
+      'stepfun/step-3.5-flash:free',
+    ]);
+
+    const routedUrls = fetchSpy.mock.calls.map((call) => String(call[0]));
+    expect(routedUrls).toEqual([
+      'https://codex.example.test/v1/responses',
+      'https://codex.example.test/v1/responses',
+      'https://codex.example.test/v1/responses',
+      'https://codex.example.test/v1/responses',
+      'https://openrouter.example.test/v1/chat/completions',
+    ]);
+
+    await app.close();
+  });
+
+  test('automatically fails back sticky routes to the primary member after the configured cooldown', async () => {
+    let now = Date.parse('2026-03-31T00:00:00Z');
+    const dateNowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const dir = writeRouterConfig({
+        providers: {
+          codex: {
+            api: 'openai-responses',
+            auth: 'api-key',
+            authHeader: true,
+            baseUrl: 'https://codex.example.test/v1',
+            models: [
+              { id: 'gpt-5.4', name: 'GPT-5.4' },
+              { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
+            ],
+          },
+        },
+        routes: [
+          {
+            id: 'codex-failover',
+            provider: 'codex',
+            aliases: ['LR/codex-failover'],
+            strategy: 'sticky-failover',
+            members: ['gpt-5.4', 'gpt-5.4-mini'],
+            failbackAfterMs: 1000,
+          },
+        ],
+      });
+
+      chdir(dir);
+      process.env.Q_CODEX_API_KEY = 'codex-secret';
+
+      let primaryShouldFail = true;
+      const fetchSpy = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { model?: string };
+
+        if (body.model === 'gpt-5.4' && primaryShouldFail) {
+          return new Response(
+            JSON.stringify({
+              error: {
+                type: 'server_error',
+                message: 'primary backend unavailable',
+              },
+            }),
+            {
+              status: 503,
+              headers: {
+                'content-type': 'application/json',
+              },
+            },
+          );
+        }
+
+        return new Response(
+          JSON.stringify({
+            id: `resp-${body.model}`,
+            output: [
+              {
+                type: 'message',
+                role: 'assistant',
+                content: [
+                  {
+                    type: 'output_text',
+                    text: `served by ${body.model}`,
+                  },
+                ],
+              },
+            ],
+          }),
+          {
+            status: 200,
+            headers: {
+              'content-type': 'application/json',
+            },
+          },
+        );
+      });
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const app = buildApp({
+        routerConfig: loadRouterRuntimeConfig(),
+        retryPolicy: {
+          maxAttempts: 1,
+          backoffMs: () => 0,
+        },
+      });
+
+      const failoverResponse = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        payload: {
+          model: 'LR/codex-failover',
+          input: 'first request',
+        },
+      });
+
+      expect(failoverResponse.statusCode).toBe(200);
+      expect(failoverResponse.body).toContain('served by gpt-5.4-mini');
+
+      now = Date.parse('2026-03-31T00:00:00.500Z');
+      primaryShouldFail = false;
+
+      const stillSecondaryResponse = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        payload: {
+          model: 'LR/codex-failover',
+          input: 'second request',
+        },
+      });
+
+      expect(stillSecondaryResponse.statusCode).toBe(200);
+      expect(stillSecondaryResponse.body).toContain('served by gpt-5.4-mini');
+
+      now = Date.parse('2026-03-31T00:00:01.500Z');
+
+      const failbackResponse = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        payload: {
+          model: 'LR/codex-failover',
+          input: 'third request',
+        },
+      });
+
+      expect(failbackResponse.statusCode).toBe(200);
+      expect(failbackResponse.body).toContain('served by gpt-5.4');
+
+      const routedModels = fetchSpy.mock.calls.map((call) => {
+        const [, init] = call as unknown as [string, RequestInit];
+        return JSON.parse(String(init.body)).model as string;
+      });
+      expect(routedModels).toEqual([
+        'gpt-5.4',
+        'gpt-5.4-mini',
+        'gpt-5.4-mini',
+        'gpt-5.4',
+      ]);
+
+      await app.close();
+    } finally {
+      dateNowSpy.mockRestore();
+    }
+  });
+
+  test('automatically includes newly added routes in the default fallback chain', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        codex: {
+          api: 'openai-responses',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://codex.example.test/v1',
+          models: [
+            {
+              id: 'gpt-5.4',
+              name: 'GPT-5.4',
+            },
+          ],
+        },
+        openrouter: {
+          api: 'openai-completions',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://openrouter.example.test/v1',
+          models: [
+            {
+              id: 'stepfun/step-3.5-flash:free',
+              name: 'step3fresh',
+            },
+          ],
+        },
+      },
+    }, {
+      routes: [
+        {
+          id: 'codex-main',
+          provider: 'codex',
+          aliases: ['writer/main'],
+          model: 'gpt-5.4',
+        },
+        {
+          id: 'openrouter-stepfun',
+          provider: 'openrouter',
+          aliases: ['LR/stepfun/step-3.5-flash:free', 'stepfun/step-3.5-flash:free'],
+          model: 'stepfun/step-3.5-flash:free',
+        },
+      ],
+    });
+
+    chdir(dir);
+    process.env.Q_CODEX_API_KEY = 'codex-secret';
+    process.env.Q_OPENROUTER_API_KEY = 'openrouter-secret';
+
+    const fetchSpy = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const body = JSON.parse(String(init?.body ?? '{}')) as { model?: string };
+
+      if (url.endsWith('/responses')) {
+        return new Response(
+          JSON.stringify({
+            error: {
+              type: 'server_error',
+              message: 'primary backend unavailable',
+            },
+          }),
+          {
+            status: 503,
+            headers: {
+              'content-type': 'application/json',
+            },
+          },
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          id: 'resp-auto-fallback',
+          choices: [
+            {
+              message: {
+                role: 'assistant',
+                content: `recovered via ${body.model}`,
+              },
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+      retryPolicy: {
+        maxAttempts: 2,
+        backoffMs: () => 0,
+      },
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'writer/main',
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      id: 'resp-auto-fallback',
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: expect.stringContaining('recovered via stepfun/step-3.5-flash:free'),
+          },
+        },
+      ],
+    });
+    expect(response.headers['x-qrouter-route-id']).toBe('openrouter-stepfun');
+    expect(response.headers['x-qrouter-upstream-model']).toBe('stepfun/step-3.5-flash:free');
+    expect(response.headers['x-qrouter-failover-used']).toBe('true');
+
+    const routedModels = fetchSpy.mock.calls.map((call) => {
+      const [, init] = call as unknown as [string, RequestInit];
+      return JSON.parse(String(init.body)).model as string;
+    });
+    expect(routedModels).toEqual([
+      'gpt-5.4',
+      'gpt-5.4',
+      'stepfun/step-3.5-flash:free',
+    ]);
+
+    await app.close();
+  });
+
+  test('appends a failover notice to streaming replies when sticky-failover advances to a candidate model within the same request', async () => {
     const dir = writeRouterConfig({
       providers: {
         modelscope: {
@@ -2645,18 +3294,6 @@ describe('provider-aware upstream routing', () => {
         backoffMs: () => 0,
       },
     });
-
-    const failedResponse = await app.inject({
-      method: 'POST',
-      url: '/v1/chat/completions',
-      payload: {
-        model: 'LR/ms',
-        messages: [{ role: 'user', content: 'trip breaker first' }],
-      },
-    });
-
-    expect(failedResponse.statusCode).toBe(200);
-    expect(failedResponse.body).toContain('请稍后重试');
 
     const streamedResponse = await app.inject({
       method: 'POST',
@@ -2886,7 +3523,7 @@ describe('provider-aware upstream routing', () => {
           content: [
             {
               type: 'output_text',
-              text: expect.stringContaining('已自动重试 3 次后仍失败'),
+              text: expect.stringContaining('当前没有可连通模型'),
             },
           ],
         },

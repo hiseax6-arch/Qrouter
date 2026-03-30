@@ -1,13 +1,13 @@
 {
   env: {
-    QINGFU_ROUTER_API_KEY: "local-dev-key",
+    Q_ROUTER_API_KEY: "local-dev-key",
   },
   models: {
     providers: {
       qingfuCodex: {
         api: "openai-completions",
         auth: "api-key",
-        apiKey: "${QINGFU_ROUTER_API_KEY}",
+        apiKey: "${Q_ROUTER_API_KEY}",
         authHeader: true,
         baseUrl: "http://127.0.0.1:4318/v1",
         models: [

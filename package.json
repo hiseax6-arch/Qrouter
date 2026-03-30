@@ -1,6 +1,7 @@
 {
-  "name": "Q-router",
+  "name": "q-router",
   "version": "0.1.0",
+  "description": "Local OpenAI-compatible router with semantic success checks and retry logic for OpenClaw.",
   "private": true,
   "type": "module",
   "scripts": {

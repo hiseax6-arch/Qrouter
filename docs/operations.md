@@ -150,7 +150,7 @@ For `LR/ms`, token usage is attributed to the concrete ModelScope backend select
 
 ## Exact Config Diff (Narrow Rollout)
 ### Paths changed by apply step
-- `env.QINGFU_ROUTER_API_KEY`
+- `env.Q_ROUTER_API_KEY`
 - `models.providers.qingfuCodex`
 - `agents.defaults.model.primary`
 - `agents.defaults.model.fallbacks`
@@ -172,7 +172,7 @@ For `LR/ms`, token usage is attributed to the concrete ModelScope backend select
 3. remove `codex/gpt-5.4` from fallback position if it was only inserted for qingfu-router rollout,
 4. remove `models.providers.qingfuCodex`,
 5. remove `agents.defaults.models["qingfuCodex/gpt-5.4"]`,
-6. optionally remove `env.QINGFU_ROUTER_API_KEY` if it was added only for this rollout,
+6. optionally remove `env.Q_ROUTER_API_KEY` if it was added only for this rollout,
 7. reload or restart the affected runtime if needed,
 8. confirm new requests no longer hit qingfu-router,
 9. preserve trace artifacts for postmortem.
@@ -182,7 +182,7 @@ For `LR/ms`, token usage is attributed to the concrete ModelScope backend select
 - `agents.defaults.model.fallbacks`
 - `models.providers.qingfuCodex`
 - `agents.defaults.models.qingfuCodex/gpt-5.4`
-- optional: `env.QINGFU_ROUTER_API_KEY`
+- optional: `env.Q_ROUTER_API_KEY`
 
 ## Pre-Release Test Checklist
 - non-stream success works,

@@ -11,6 +11,7 @@
     "openrouter": {
       "api": "openai-completions",
       "baseUrl": "https://openrouter.ai/api/v1",
+      "apiKeyEnv": "Q_OPENROUTER_API_KEY",
       "models": [
         {
           "id": "stepfun/step-3.5-flash:free",
@@ -24,14 +25,14 @@
           "contextWindow": 128000,
           "maxTokens": 32000
         }
-      ],
-      "apiKey": "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"
+      ]
     },
     "codex": {
       "api": "openai-responses",
       "auth": "api-key",
       "authHeader": true,
       "baseUrl": "https://codex.0u0o.com/v1",
+      "apiKeyEnv": "Q_CODEX_API_KEY",
       "headers": {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) OpenClaw/2026.2.14",
         "Accept": "application/json"
@@ -51,17 +52,17 @@
             "cacheRead": 0.175,
             "cacheWrite": 0.175
           },
-          "contextWindow": 270000,
+          "contextWindow": 1050000,
           "maxTokens": 128000
         }
-      ],
-      "apiKey": "sk-3c8421ac7a0e04db4dfa955f8b27b124bc79781bd870cb9c8638e8b258988116"
+      ]
     },
     "modelscope": {
       "api": "openai-completions",
       "baseUrl": "https://api-inference.modelscope.cn/v1",
       "auth": "api-key",
       "authHeader": true,
+      "apiKeyEnv": "Q_MODELSCOPE_API_KEY",
       "models": [
         {
           "id": "MiniMax/MiniMax-M2.5",
@@ -87,8 +88,7 @@
           "contextWindow": 200000,
           "maxTokens": 32000
         }
-      ],
-      "apiKey": "ms-5d1ce597-46b2-478b-8b7a-70f44a0cf0c5"
+      ]
     }
   },
   "traces": {

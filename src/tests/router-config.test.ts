@@ -38,12 +38,15 @@ afterEach(() => {
   }
 });
 
-function writeRouterConfig(config: unknown, mappings?: unknown): string {
+function writeRouterConfig(config: unknown, mappings?: unknown, localConfig?: unknown): string {
   const dir = mkdtempSync(join(tmpdir(), 'Q-router-config-'));
   const configDir = join(dir, 'config');
   mkdirSync(configDir, { recursive: true });
   const configPath = join(configDir, 'router.json');
   writeFileSync(configPath, JSON.stringify(config, null, 2));
+  if (localConfig !== undefined) {
+    writeFileSync(join(configDir, 'router.local.json'), JSON.stringify(localConfig, null, 2));
+  }
   if (mappings !== undefined) {
     writeFileSync(join(configDir, 'model-mappings.json'), JSON.stringify(mappings, null, 2));
   }
@@ -367,6 +370,58 @@ describe('router config file', () => {
 
     expect(runtime.configPath).toBe(join(originalCwd, 'config', 'router.json'));
     expect(runtime.models.allow.length).toBeGreaterThan(0);
+  });
+
+  test('merges config/router.local.json on top of config/router.json in the current workspace', () => {
+    const dir = writeRouterConfig(
+      {
+        server: {
+          host: '127.0.0.1',
+          port: 4318,
+        },
+        providers: {
+          codex: {
+            api: 'openai-responses',
+            baseUrl: 'https://codex.example.test/v1',
+            models: [{ id: 'gpt-5.4', name: 'GPT-5.4' }],
+          },
+        },
+        models: {
+          allow: ['public-model'],
+        },
+      },
+      undefined,
+      {
+        server: {
+          port: 9999,
+        },
+        providers: {
+          codex: {
+            apiKey: 'local-secret',
+          },
+        },
+        models: {
+          allow: ['local-model'],
+        },
+      },
+    );
+
+    chdir(dir);
+
+    const runtime = loadRouterRuntimeConfig();
+
+    expect(runtime.configPath).toBe(join(dir, 'config', 'router.local.json'));
+    expect(runtime.server).toEqual({
+      host: '127.0.0.1',
+      port: 9999,
+    });
+    expect(runtime.models.allow).toEqual(['local-model']);
+    expect(runtime.providers.codex).toMatchObject({
+      api: 'openai-responses',
+      apiKey: 'local-secret',
+      baseUrl: 'https://codex.example.test/v1',
+      models: [{ id: 'gpt-5.4', name: 'GPT-5.4' }],
+    });
   });
 
   test('exposes startup metadata through /health', async () => {

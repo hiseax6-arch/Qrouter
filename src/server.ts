@@ -14,6 +14,7 @@ export type BuildAppOptions = {
 };
 
 const DEFAULT_RETRIES_BEFORE_VISIBLE_REPLY = 3;
+const DEFAULT_BODY_LIMIT_BYTES = 32 * 1024 * 1024;
 
 const defaultRetryPolicy: RetryPolicy = {
   maxAttempts: DEFAULT_RETRIES_BEFORE_VISIBLE_REPLY + 1,
@@ -52,7 +53,9 @@ function parseBooleanQuery(value: unknown): boolean | undefined {
 }
 
 export function buildApp(options: BuildAppOptions = {}) {
-  const app = Fastify();
+  const app = Fastify({
+    bodyLimit: DEFAULT_BODY_LIMIT_BYTES,
+  });
   const routerConfig = options.routerConfig ?? loadRouterRuntimeConfig();
   const routingTable = compileRoutingTable(routerConfig);
 
@@ -141,6 +144,7 @@ export function buildApp(options: BuildAppOptions = {}) {
         source: route.source,
         strategy: route.strategy,
         aliases: route.aliases,
+        ...(typeof route.failbackAfterMs === 'number' ? { failbackAfterMs: route.failbackAfterMs } : {}),
         providerId: route.providerId,
         providerApi: provider?.api ?? null,
         providerBaseUrl,

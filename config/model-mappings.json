@@ -27,6 +27,10 @@
         "gpt-5.4",
         "codex/gpt-5.4"
       ],
+      "fallbacks": [
+        "LR/stepfun/step-3.5-flash:free",
+        "LR/ms"
+      ],
       "model": "gpt-5.4"
     },
     {

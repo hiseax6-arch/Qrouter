@@ -543,6 +543,7 @@ describe('POST /v1/chat/completions', () => {
   test('returns a visible assistant reply when all attempts end as empty-success', async () => {
     let attempts = 0;
     const app = buildApp({
+      routerConfig: minimalResponsesRuntimeConfig,
       traceStore: createNoopTraceStore(),
       retryPolicy: {
         maxAttempts: 2,
@@ -589,7 +590,7 @@ describe('POST /v1/chat/completions', () => {
         },
       ],
     });
-    expect((response.json() as { choices: Array<{ message: { content: string } }> }).choices[0].message.content).toContain('已自动重试 1 次后仍失败');
+    expect((response.json() as { choices: Array<{ message: { content: string } }> }).choices[0].message.content).toContain('当前没有可连通模型');
     expect(attempts).toBe(2);
 
     await app.close();
@@ -828,6 +829,7 @@ describe('POST /v1/chat/completions', () => {
     const traceStore = createTraceStore({ jsonlPath, sqlitePath });
 
     const app = buildApp({
+      routerConfig: minimalResponsesRuntimeConfig,
       retryPolicy: {
         maxAttempts: 2,
         backoffMs: () => 0,
@@ -909,6 +911,7 @@ describe('POST /v1/chat/completions', () => {
 
     let attempts = 0;
     const app = buildApp({
+      routerConfig: minimalResponsesRuntimeConfig,
       traceStore,
       fetchUpstream: async () => {
         attempts += 1;
@@ -951,7 +954,7 @@ describe('POST /v1/chat/completions', () => {
         {
           message: {
             role: 'assistant',
-            content: expect.stringContaining('已自动重试 3 次后仍失败'),
+            content: expect.stringContaining('当前没有可连通模型'),
           },
         },
       ],

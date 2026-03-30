@@ -1,0 +1,13 @@
+{
+  "providers": {
+    "openrouter": {
+      "apiKey": "replace-with-openrouter-key"
+    },
+    "codex": {
+      "apiKey": "replace-with-codex-key"
+    },
+    "modelscope": {
+      "apiKey": "replace-with-modelscope-key"
+    }
+  }
+}

@@ -38,11 +38,10 @@ import {
 import { buildContextLimitErrorPayload, checkContextLimit } from './context-limit.js';
 import type { CompiledRoute } from '../routing/routes.js';
 import {
-  advanceStickyFailoverRoute,
   resolveDirectRoute,
-  rotateRoundRobinRoute,
   selectRoundRobinRoute,
   selectStickyFailoverRoute,
+  setStickyFailoverRouteMember,
 } from '../routing/routes.js';
 import { applyQrouterObservabilityHeaders } from '../observability/qrouter.js';
 import { nowTraceTimestamp, type TraceStore } from '../traces/store.js';
@@ -66,6 +65,10 @@ type ChatCompletionsRequestBody = {
   model?: string;
   stream?: boolean;
   messages?: unknown[];
+  qrouter?: {
+    noFallback?: boolean;
+    strictPrimary?: boolean;
+  };
 };
 
 type StreamProbeResult =
@@ -156,6 +159,58 @@ function classifyThrownUpstreamError(error: unknown): 'timeout' | 'connection_er
 
 function isStreamingRequest(body: ChatCompletionsRequestBody): boolean {
   return body.stream === true;
+}
+
+function parseBooleanFlag(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value === 'number') {
+    if (value === 1) {
+      return true;
+    }
+    if (value === 0) {
+      return false;
+    }
+    return undefined;
+  }
+
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on') {
+    return true;
+  }
+  if (normalized === 'false' || normalized === '0' || normalized === 'no' || normalized === 'off') {
+    return false;
+  }
+
+  return undefined;
+}
+
+function extractRequestRoutingControls(
+  request: FastifyRequest,
+  body: Record<string, unknown>,
+): { disableFallback: boolean } {
+  const qrouter = body.qrouter && typeof body.qrouter === 'object'
+    ? body.qrouter as Record<string, unknown>
+    : null;
+  const headerNoFallback = request.headers['x-qrouter-no-fallback'];
+  const headerStrictPrimary = request.headers['x-qrouter-strict-primary'];
+
+  delete body.qrouter;
+
+  const disableFallback =
+    parseBooleanFlag(qrouter?.noFallback)
+    ?? parseBooleanFlag(qrouter?.strictPrimary)
+    ?? parseBooleanFlag(Array.isArray(headerNoFallback) ? headerNoFallback[0] : headerNoFallback)
+    ?? parseBooleanFlag(Array.isArray(headerStrictPrimary) ? headerStrictPrimary[0] : headerStrictPrimary)
+    ?? false;
+
+  return { disableFallback };
 }
 
 function buildTraceEvent(requestId: string, event: string, data: Record<string, unknown>) {
@@ -407,6 +462,7 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
   ) {
     const requestId = randomUUID();
     const body = (request.body ?? {}) as ChatCompletionsRequestBody;
+    const requestRoutingControls = extractRequestRoutingControls(request, body as Record<string, unknown>);
     const rawRequestedModel = body.model ?? null;
     const requestedModel = resolveRequestedModelAlias(rawRequestedModel, deps.allowedModels);
     if (requestedModel && requestedModel !== rawRequestedModel) {
@@ -425,9 +481,14 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
       body.model = multiRouteSelection.upstreamModel;
       model = multiRouteSelection.upstreamModel;
     }
-    const directRouteSelection = multiRoute
+    let directRouteSelection = multiRoute
       ? null
       : resolveDirectRoute(requestedModel, deps.routes ?? []);
+    const primaryRoute = multiRoute ?? directRouteSelection?.route ?? null;
+    let fallbackActivated = false;
+    const fallbackAliases = [...(primaryRoute?.fallbackAliases ?? [])];
+    let fallbackAliasCursor = 0;
+    let fallbackChainExhausted = false;
 
     const stream = isStreamingRequest(body);
     let committed = false;
@@ -435,6 +496,7 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
     let finalClassification = 'unknown';
     let errorClass: string | null = null;
     let attemptsUsed = 0;
+    let candidateAttempt = 0;
     let cumulativeTokenUsage: TokenUsage | null = null;
     let lastUpstreamError: UpstreamErrorDetails | null = null;
     const visibleResponseModel = rawRequestedModel ?? requestedModel ?? model;
@@ -446,24 +508,80 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
       ?? null;
     let lastUpstreamModel: string | null = directRouteSelection?.upstreamModel
       ?? (typeof model === 'string' && model.length > 0 ? model : null);
+    let currentMultiRouteTriedMembers = new Set<number>();
 
-    function advanceAliasFallback(nextAttempt: number, reason: string) {
-      if (!multiRoute || multiRouteMemberIndex === null || multiRoute.strategy !== 'round-robin') {
-        return;
+    function applyRouteTarget(alias: string | null): boolean {
+      if (typeof alias !== 'string' || alias.length === 0) {
+        return false;
       }
 
-      const nextSelection = rotateRoundRobinRoute(multiRoute, multiRouteMemberIndex);
-      if (!nextSelection) {
-        return;
+      const nextMultiRouteSelection =
+        selectRoundRobinRoute(alias, deps.routes ?? [])
+        ?? selectStickyFailoverRoute(alias, deps.routes ?? []);
+      if (nextMultiRouteSelection) {
+        multiRoute = nextMultiRouteSelection.route;
+        multiRouteMemberIndex = nextMultiRouteSelection.memberIndex;
+        directRouteSelection = null;
+        model = nextMultiRouteSelection.upstreamModel;
+        body.model = model;
+        lastProviderId = nextMultiRouteSelection.providerId;
+        lastRouteId = nextMultiRouteSelection.route.id;
+        lastUpstreamModel = model;
+        return true;
+      }
+
+      const nextDirectRouteSelection = resolveDirectRoute(alias, deps.routes ?? []);
+      if (!nextDirectRouteSelection) {
+        return false;
+      }
+
+      multiRoute = null;
+      multiRouteMemberIndex = null;
+      directRouteSelection = nextDirectRouteSelection;
+      model = nextDirectRouteSelection.upstreamModel;
+      body.model = model;
+      lastProviderId = nextDirectRouteSelection.providerId;
+      lastRouteId = nextDirectRouteSelection.route.id;
+      lastUpstreamModel = nextDirectRouteSelection.upstreamModel;
+      return true;
+    }
+
+    function resetCurrentRouteMemberTracking() {
+      currentMultiRouteTriedMembers = new Set<number>();
+      if (multiRouteMemberIndex !== null) {
+        currentMultiRouteTriedMembers.add(multiRouteMemberIndex);
+      }
+    }
+
+    function advanceCurrentMultiRouteMember(nextAttempt: number, reason: string): boolean {
+      if (!multiRoute || multiRouteMemberIndex === null || !multiRoute.members || multiRoute.members.length === 0) {
+        return false;
+      }
+
+      let nextMemberIndex: number | null = null;
+      for (let offset = 1; offset < multiRoute.members.length; offset += 1) {
+        const candidateIndex = (multiRouteMemberIndex + offset) % multiRoute.members.length;
+        if (!currentMultiRouteTriedMembers.has(candidateIndex)) {
+          nextMemberIndex = candidateIndex;
+          break;
+        }
+      }
+
+      if (nextMemberIndex === null) {
+        return false;
       }
 
       const previousModel = model;
-      multiRouteMemberIndex = nextSelection.memberIndex;
-      model = nextSelection.upstreamModel;
+      multiRouteMemberIndex = nextMemberIndex;
+      model = multiRoute.members[nextMemberIndex];
       body.model = model;
       lastProviderId = multiRoute.providerId;
       lastRouteId = multiRoute.id;
       lastUpstreamModel = model;
+      currentMultiRouteTriedMembers.add(nextMemberIndex);
+      if (multiRoute.strategy === 'sticky-failover') {
+        setStickyFailoverRouteMember(multiRoute, nextMemberIndex);
+      }
 
       deps.traceStore.appendEvent(
         buildTraceEvent(requestId, 'alias_model_rotated', {
@@ -476,30 +594,69 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
           classification: reason,
         }),
       );
+      return true;
     }
 
-    function advanceStickyAliasAfterFailure(attempt: number, reason: string) {
-      if (!multiRoute || multiRouteMemberIndex === null || multiRoute.strategy !== 'sticky-failover') {
-        return;
+    function maybeActivateFallbackForNextAttempt(nextAttempt: number, reason: string): boolean {
+      if (candidateAttempt < deps.retryPolicy.maxAttempts) {
+        return false;
       }
 
-      const previousModel = model;
-      const nextSelection = advanceStickyFailoverRoute(multiRoute, multiRouteMemberIndex);
-      if (!nextSelection) {
-        return;
+      if (requestRoutingControls.disableFallback) {
+        deps.traceStore.appendEvent(
+          buildTraceEvent(requestId, 'fallback_skipped_by_policy', {
+            attempt: nextAttempt - 1,
+            requestedModel,
+            routeId: primaryRoute?.id,
+            model,
+            stream,
+          }),
+        );
+        return false;
       }
 
+      if (advanceCurrentMultiRouteMember(nextAttempt, reason)) {
+        candidateAttempt = 0;
+        return true;
+      }
+
+      while (fallbackAliasCursor < fallbackAliases.length) {
+        const fallbackAlias = fallbackAliases[fallbackAliasCursor++];
+        const previousModel = model;
+        if (!applyRouteTarget(fallbackAlias)) {
+          continue;
+        }
+
+        fallbackActivated = true;
+        candidateAttempt = 0;
+        resetCurrentRouteMemberTracking();
+        deps.traceStore.appendEvent(
+          buildTraceEvent(requestId, 'fallback_route_activated', {
+            attempt: nextAttempt,
+            requestedModel,
+            routeId: primaryRoute?.id,
+            fallbackAlias,
+            previousModel,
+            model,
+            stream,
+            classification: reason,
+          }),
+        );
+        return true;
+      }
+
+      fallbackChainExhausted = true;
       deps.traceStore.appendEvent(
-        buildTraceEvent(requestId, 'alias_model_rotated', {
-          attempt,
+        buildTraceEvent(requestId, 'fallback_chain_exhausted', {
+          attempt: nextAttempt - 1,
           requestedModel,
-          routeId: multiRoute.id,
-          previousModel,
-          model: nextSelection.upstreamModel,
+          routeId: primaryRoute?.id,
+          model,
           stream,
           classification: reason,
         }),
       );
+      return false;
     }
 
     function recordSummary(attempts: number) {
@@ -586,12 +743,24 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
 
     function resolveFailoverNotice() {
       if (
+        typeof model !== 'string'
+        || model.length === 0
+      ) {
+        return null;
+      }
+
+      if (fallbackActivated) {
+        return buildFailoverNotice({
+          requestedModel: visibleResponseModel,
+          activeModel: model,
+        });
+      }
+
+      if (
         !multiRoute
         || multiRoute.strategy !== 'sticky-failover'
         || multiRouteMemberIndex === null
         || multiRouteMemberIndex <= 0
-        || typeof model !== 'string'
-        || model.length === 0
       ) {
         return null;
       }
@@ -603,6 +772,18 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
     }
 
     function resolveFailoverState() {
+      if (
+        fallbackActivated
+      ) {
+        return {
+          used: true,
+          from: primaryRoute?.strategy === 'direct'
+            ? primaryRoute.upstreamModel ?? null
+            : primaryRoute?.members?.[0] ?? null,
+          to: lastUpstreamModel ?? (typeof model === 'string' ? model : null),
+        };
+      }
+
       if (
         !multiRoute
         || multiRoute.strategy !== 'sticky-failover'
@@ -639,6 +820,8 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
         failoverTo: failover.to,
       };
     }
+
+    resetCurrentRouteMemberTracking();
 
     deps.traceStore.appendEvent(
       buildTraceEvent(requestId, 'request_received', {
@@ -751,6 +934,7 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
             finalErrorClass: finalClassification,
             upstreamStatus: lastStatus,
             upstreamError: lastUpstreamError,
+            fallbackChainExhausted,
           }),
         );
       }
@@ -763,6 +947,7 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
           finalErrorClass: finalClassification,
           upstreamStatus: lastStatus,
           upstreamError: lastUpstreamError,
+          fallbackChainExhausted,
         }),
       );
     }
@@ -793,8 +978,10 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
       );
     }
 
-    for (let attempt = 1; attempt <= deps.retryPolicy.maxAttempts; attempt += 1) {
+    while (true) {
+      const attempt = attemptsUsed + 1;
       attemptsUsed = attempt;
+      candidateAttempt += 1;
       deps.traceStore.appendEvent(
         buildTraceEvent(requestId, 'attempt_started', {
           attempt,
@@ -811,8 +998,9 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
           : null;
         lastProviderId = multiRoute?.providerId ?? upstream.providerId ?? lastProviderId;
         lastRouteId = multiRoute?.id ?? upstream.routeId ?? lastRouteId;
-        lastUpstreamModel =
-          typeof model === 'string' && model.length > 0 ? model : lastUpstreamModel;
+        lastUpstreamModel = multiRoute
+          ? (typeof model === 'string' && model.length > 0 ? model : lastUpstreamModel)
+          : (directRouteSelection?.upstreamModel ?? lastUpstreamModel);
 
         deps.traceStore.appendEvent(
           buildTraceEvent(requestId, 'upstream_response', {
@@ -971,13 +1159,16 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
                 }),
               );
 
-              if (attempt < deps.retryPolicy.maxAttempts) {
-                advanceAliasFallback(attempt + 1, finalClassification);
-                await sleep(deps.retryPolicy.backoffMs(attempt, finalClassification));
+              if (candidateAttempt < deps.retryPolicy.maxAttempts) {
+                await sleep(deps.retryPolicy.backoffMs(candidateAttempt, finalClassification));
                 continue;
               }
 
-              advanceStickyAliasAfterFailure(attempt, finalClassification);
+              if (maybeActivateFallbackForNextAttempt(attempt + 1, finalClassification)) {
+                await sleep(deps.retryPolicy.backoffMs(candidateAttempt, finalClassification));
+                continue;
+              }
+
               return returnVisibleFailureReply(attempt);
             }
             attemptTokenUsage = await resolveAttemptTokenUsage({
@@ -1033,13 +1224,16 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
             );
           }
 
-          if (attempt < deps.retryPolicy.maxAttempts) {
-            advanceAliasFallback(attempt + 1, finalClassification);
-            await sleep(deps.retryPolicy.backoffMs(attempt, finalClassification));
+          if (candidateAttempt < deps.retryPolicy.maxAttempts) {
+            await sleep(deps.retryPolicy.backoffMs(candidateAttempt, finalClassification));
             continue;
           }
 
-          advanceStickyAliasAfterFailure(attempt, finalClassification);
+          if (maybeActivateFallbackForNextAttempt(attempt + 1, finalClassification)) {
+            await sleep(deps.retryPolicy.backoffMs(candidateAttempt, finalClassification));
+            continue;
+          }
+
           return returnVisibleFailureReply(attempt);
         }
 
@@ -1055,19 +1249,21 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
             }),
           );
 
-          if (attempt < deps.retryPolicy.maxAttempts) {
-            advanceAliasFallback(attempt + 1, finalClassification);
-            await sleep(deps.retryPolicy.backoffMs(attempt, finalClassification));
+          if (candidateAttempt < deps.retryPolicy.maxAttempts) {
+            await sleep(deps.retryPolicy.backoffMs(candidateAttempt, finalClassification));
             continue;
           }
 
-          advanceStickyAliasAfterFailure(attempt, finalClassification);
+          if (maybeActivateFallbackForNextAttempt(attempt + 1, finalClassification)) {
+            await sleep(deps.retryPolicy.backoffMs(candidateAttempt, finalClassification));
+            continue;
+          }
+
           return returnVisibleFailureReply(attempt);
         }
 
         finalClassification = `http_${upstream.status}`;
         errorClass = finalClassification;
-        advanceStickyAliasAfterFailure(attempt, finalClassification);
         return returnTerminalFailureReply(attempt);
       } catch (error) {
         finalClassification = classifyThrownUpstreamError(error);
@@ -1081,28 +1277,18 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
           }),
         );
 
-        if (attempt < deps.retryPolicy.maxAttempts) {
-          advanceAliasFallback(attempt + 1, finalClassification);
-          await sleep(deps.retryPolicy.backoffMs(attempt, finalClassification));
+        if (candidateAttempt < deps.retryPolicy.maxAttempts) {
+          await sleep(deps.retryPolicy.backoffMs(candidateAttempt, finalClassification));
           continue;
         }
 
-        advanceStickyAliasAfterFailure(attempt, finalClassification);
+        if (maybeActivateFallbackForNextAttempt(attempt + 1, finalClassification)) {
+          await sleep(deps.retryPolicy.backoffMs(candidateAttempt, finalClassification));
+          continue;
+        }
+
         return returnVisibleFailureReply(attempt);
       }
     }
-
-    recordSummary(attemptsUsed);
-    appendRequestCompleted(attemptsUsed);
-    applyQrouterObservabilityHeaders(reply, buildObservability(attemptsUsed));
-    return reply.code(500).send({
-      error: {
-        message: 'Router exhausted control flow unexpectedly.',
-        type: 'router_internal_error',
-        request_id: requestId,
-        attempts: attemptsUsed,
-        final_error_class: finalClassification,
-      },
-    });
   };
 }

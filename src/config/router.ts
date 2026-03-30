@@ -34,9 +34,11 @@ export type RouterRouteConfig = {
   id?: string;
   provider: string;
   aliases?: string[];
+  fallbacks?: string[];
   model?: string;
   strategy?: 'direct' | 'round-robin' | 'sticky-failover';
   members?: string[];
+  failbackAfterMs?: number;
 };
 
 export type ThinkingRewriteRule = {
@@ -152,6 +154,82 @@ function uniqueStrings(values: Array<string | undefined>): string[] {
   return items;
 }
 
+function mergeProviderConfigs(
+  baseProviders: Record<string, RouterProviderConfig> | undefined,
+  overrideProviders: Record<string, RouterProviderConfig> | undefined,
+): Record<string, RouterProviderConfig> | undefined {
+  if (!baseProviders && !overrideProviders) {
+    return undefined;
+  }
+
+  const providerIds = new Set([
+    ...Object.keys(baseProviders ?? {}),
+    ...Object.keys(overrideProviders ?? {}),
+  ]);
+
+  return Object.fromEntries(
+    [...providerIds].map((providerId) => {
+      const base = baseProviders?.[providerId];
+      const override = overrideProviders?.[providerId];
+
+      return [
+        providerId,
+        {
+          ...(base ?? {}),
+          ...(override ?? {}),
+          headers: {
+            ...(base?.headers ?? {}),
+            ...(override?.headers ?? {}),
+          },
+          models: override?.models ?? base?.models,
+        },
+      ];
+    }),
+  );
+}
+
+function mergeThinkingConfig(
+  baseThinking: RouterThinkingConfig | undefined,
+  overrideThinking: RouterThinkingConfig | undefined,
+): RouterThinkingConfig | undefined {
+  if (!baseThinking && !overrideThinking) {
+    return undefined;
+  }
+
+  return {
+    ...(baseThinking ?? {}),
+    ...(overrideThinking ?? {}),
+    mappings: overrideThinking?.mappings ?? baseThinking?.mappings,
+  };
+}
+
+function mergeRouterFileConfig(base: RouterFileConfig, override: RouterFileConfig): RouterFileConfig {
+  return {
+    ...base,
+    ...override,
+    server: {
+      ...(base.server ?? {}),
+      ...(override.server ?? {}),
+    },
+    upstream: {
+      ...(base.upstream ?? {}),
+      ...(override.upstream ?? {}),
+    },
+    providers: mergeProviderConfigs(base.providers, override.providers),
+    routes: override.routes ?? base.routes,
+    models: {
+      ...(base.models ?? {}),
+      ...(override.models ?? {}),
+      allow: override.models?.allow ?? base.models?.allow,
+    },
+    thinking: mergeThinkingConfig(base.thinking, override.thinking),
+    traces: {
+      ...(base.traces ?? {}),
+      ...(override.traces ?? {}),
+    },
+  };
+}
+
 function resolveProviderApiKey(
   providerId: string,
   providerConfig: RouterProviderConfig,
@@ -184,9 +262,9 @@ function resolveProviderApiKey(
   return {};
 }
 
-function resolveProjectRelativeConfigPath(): string {
+function resolveProjectRelativeConfigPath(fileName = 'router.json'): string {
   const moduleDir = dirname(fileURLToPath(import.meta.url));
-  return resolve(moduleDir, '../../config/router.json');
+  return resolve(moduleDir, `../../config/${fileName}`);
 }
 
 function resolveProjectRelativeMappingsPath(): string {
@@ -200,12 +278,20 @@ export function resolveRouterConfigPath(): string {
     return resolve(explicit);
   }
 
-  const cwdCandidate = resolve(process.cwd(), 'config/router.json');
-  if (existsSync(cwdCandidate)) {
-    return cwdCandidate;
+  const candidates = [
+    resolve(process.cwd(), 'config/router.local.json'),
+    resolve(process.cwd(), 'config/router.json'),
+    resolveProjectRelativeConfigPath('router.local.json'),
+    resolveProjectRelativeConfigPath('router.json'),
+  ];
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
   }
 
-  return resolveProjectRelativeConfigPath();
+  return resolveProjectRelativeConfigPath('router.json');
 }
 
 export function resolveRouterMappingsPath(configPath = resolveRouterConfigPath()): string | undefined {
@@ -240,7 +326,19 @@ function readRouterFileConfig(configPath: string): RouterFileConfig {
     return {};
   }
 
-  return JSON.parse(readFileSync(configPath, 'utf8')) as RouterFileConfig;
+  const primaryConfig = JSON.parse(readFileSync(configPath, 'utf8')) as RouterFileConfig;
+  const localConfigPath = resolve(dirname(configPath), 'router.local.json');
+  const baseConfigPath = resolve(dirname(configPath), 'router.json');
+
+  if (
+    resolve(configPath) === localConfigPath &&
+    existsSync(baseConfigPath)
+  ) {
+    const baseConfig = JSON.parse(readFileSync(baseConfigPath, 'utf8')) as RouterFileConfig;
+    return mergeRouterFileConfig(baseConfig, primaryConfig);
+  }
+
+  return primaryConfig;
 }
 
 function readRouterMappingsFileConfig(

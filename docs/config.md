@@ -5,7 +5,7 @@ This document defines the intended configuration surface for qingfu-router and t
 
 ## Configuration Principles
 - Keep OpenClaw config changes **small and reversible**.
-- Keep real upstream credentials/base URLs inside router config where possible.
+- Keep committed config files secret-free; use env vars or a gitignored local override for credentials.
 - Make retry behavior explicit and inspectable.
 - Make observability configurable but enabled by default in development.
 
@@ -16,6 +16,7 @@ The current code now supports two config styles:
 
 Compatibility rules:
 - existing `config/router.json` keeps working unchanged
+- if `config/router.local.json` exists, it is merged on top of `config/router.json` for the current workspace
 - if `routes` is present and `models.allow` is omitted, the allow-list is derived from route aliases
 - provider secrets can now be declared with `apiKeyEnv`
 - legacy `QINGFU_*` env names are accepted as compatibility aliases, but `Q_ROUTER_*`, `Q_UPSTREAM_*`, and `Q_TRACE_*` are the primary runtime names
@@ -35,6 +36,7 @@ Example explicit route shape:
       "id": "codex-main",
       "provider": "codex",
       "aliases": ["LR/gpt-5.4", "gpt-5.4", "codex/gpt-5.4"],
+      "fallbacks": ["LR/stepfun/step-3.5-flash:free", "LR/ms"],
       "model": "gpt-5.4"
     }
   ]
@@ -46,21 +48,21 @@ Example explicit route shape:
 Good for secrets and deployment-specific values.
 
 Suggested env vars:
-- `QINGFU_ROUTER_PORT`
-- `QINGFU_ROUTER_HOST`
-- `QINGFU_ROUTER_API_KEY` (optional local guard)
-- `QINGFU_UPSTREAM_BASE_URL`
-- `QINGFU_UPSTREAM_API_KEY`
-- `QINGFU_UPSTREAM_TIMEOUT_MS`
-- `QINGFU_TRACE_DIR`
-- `QINGFU_TRACE_SQLITE_PATH`
+- `Q_ROUTER_PORT`
+- `Q_ROUTER_HOST`
+- `Q_ROUTER_API_KEY` (used by the OpenClaw-side integration helper)
+- `Q_UPSTREAM_BASE_URL`
+- `Q_UPSTREAM_API_KEY`
+- `Q_UPSTREAM_TIMEOUT_MS`
+- `Q_TRACE_DIR`
+- `Q_TRACE_SQLITE_PATH`
 
 ### 2. Local config file
 Good for stable, non-secret policy settings.
 
 Suggested file path:
 - `config/router.json`
-- or `config/router.json5`
+- `config/router.local.json` for machine-local overrides that should not be committed
 
 Suggested contents:
 - endpoint enablement,
@@ -70,6 +72,11 @@ Suggested contents:
 - trace toggles,
 - model routing defaults,
 - thinking compatibility policy.
+
+Resolution order:
+1. `Q_ROUTER_CONFIG_PATH` / `QINGFU_ROUTER_CONFIG_PATH`
+2. `config/router.local.json`
+3. `config/router.json`
 
 ## Proposed Router Config Shape (Draft)
 ```json5
@@ -133,6 +140,47 @@ Suggested configurable values:
 - whether to retry on malformed 2xx payloads
 - whether to respect upstream `Retry-After`
 
+## Fallback Controls
+Current runtime behavior:
+- retry budget is applied per candidate model, not once for the whole request
+- after one candidate exhausts its budget, the router advances to the next alias in `fallbacks`
+- if `fallbacks` is omitted, Q-router appends the other known routes as a default candidate chain
+
+Request-level override:
+- body:
+  ```json
+  {
+    "qrouter": {
+      "noFallback": true
+    }
+  }
+  ```
+- or header: `x-qrouter-no-fallback: true`
+
+When `noFallback` is enabled, Q-router retries only the originally resolved model and will not advance to fallback aliases or the next sticky member.
+
+## Sticky Failback
+`sticky-failover` routes can now declare `failbackAfterMs`:
+
+```json
+{
+  "id": "modelscope-ms-pool",
+  "provider": "modelscope",
+  "strategy": "sticky-failover",
+  "aliases": ["LR/ms", "ms"],
+  "members": [
+    "MiniMax/MiniMax-M2.5",
+    "ZhipuAI/GLM-5"
+  ],
+  "failbackAfterMs": 300000
+}
+```
+
+Behavior:
+- if the route fails over to a secondary member, that member stays active for subsequent requests
+- once the cooldown elapses, Q-router automatically tries the first member again on the next request
+- direct routes such as `LR/gpt-5.4` already re-enter at their original primary model every new request; `failbackAfterMs` mainly matters for sticky pools such as `LR/ms`
+
 ## Thinking Compatibility Switch
 `thinking` config now has two layers:
 - `mappingsEnabled`: whether custom thinking rewrite rules are active.
@@ -182,14 +230,14 @@ Use a dedicated provider entry pointing at qingfu-router.
 ```json5
 {
   env: {
-    QINGFU_ROUTER_API_KEY: "local-dev-key"
+    Q_ROUTER_API_KEY: "local-dev-key"
   },
   models: {
     providers: {
       qingfuCodex: {
         api: "openai-completions",
         auth: "api-key",
-        apiKey: "${QINGFU_ROUTER_API_KEY}",
+        apiKey: "${Q_ROUTER_API_KEY}",
         authHeader: true,
         baseUrl: "http://127.0.0.1:4318/v1",
         models: [

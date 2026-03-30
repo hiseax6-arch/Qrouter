@@ -21,7 +21,13 @@ import {
 } from './model-normalization.js';
 import { buildContextLimitErrorPayload, checkContextLimit } from './context-limit.js';
 import type { CompiledRoute } from '../routing/routes.js';
-import { resolveDirectRoute } from '../routing/routes.js';
+import {
+  advanceStickyFailoverRoute,
+  resolveDirectRoute,
+  rotateRoundRobinRoute,
+  selectRoundRobinRoute,
+  selectStickyFailoverRoute,
+} from '../routing/routes.js';
 import {
   appendResponsesQrouterMetadata,
   applyQrouterObservabilityHeaders,
@@ -207,26 +213,47 @@ export function createResponsesHandler(deps: ResponsesDeps) {
     const requestId = randomUUID();
     const body = (request.body ?? {}) as ResponsesRequestBody;
     const rawRequestedModel = body.model ?? null;
-    const model = resolveRequestedModelAlias(rawRequestedModel, deps.allowedModels);
-    if (model && model !== rawRequestedModel) {
-      body.model = model;
+    const requestedModel = resolveRequestedModelAlias(rawRequestedModel, deps.allowedModels);
+    if (requestedModel && requestedModel !== rawRequestedModel) {
+      body.model = requestedModel;
     }
-    const directRouteSelection = resolveDirectRoute(model, deps.routes ?? []);
+    let model = requestedModel;
+    let multiRoute: CompiledRoute | null = null;
+    let multiRouteMemberIndex: number | null = null;
+    const multiRouteSelection =
+      selectRoundRobinRoute(requestedModel, deps.routes ?? [])
+      ?? selectStickyFailoverRoute(requestedModel, deps.routes ?? []);
+    if (multiRouteSelection) {
+      multiRoute = multiRouteSelection.route;
+      multiRouteMemberIndex = multiRouteSelection.memberIndex;
+      body.model = multiRouteSelection.upstreamModel;
+      model = multiRouteSelection.upstreamModel;
+    }
+    const directRouteSelection = multiRoute
+      ? null
+      : resolveDirectRoute(requestedModel, deps.routes ?? []);
     const stream = isStreamingRequest(body);
-    const visibleResponseModel = rawRequestedModel ?? model;
+    const visibleResponseModel = rawRequestedModel ?? requestedModel ?? model;
     let committed = false;
     let finalClassification = 'unknown';
     let errorClass: string | null = null;
     let lastStatus: number | null = null;
     let lastUpstreamError: UpstreamErrorDetails | null = null;
-    let lastProviderId: string | null = directRouteSelection?.providerId ?? null;
-    let lastRouteId: string | null = directRouteSelection?.route.id ?? null;
-    let lastUpstreamModel: string | null = directRouteSelection?.upstreamModel ?? model ?? null;
+    let lastProviderId: string | null = multiRoute?.providerId ?? directRouteSelection?.providerId ?? null;
+    let lastRouteId: string | null = multiRoute?.id ?? directRouteSelection?.route.id ?? null;
+    let lastUpstreamModel: string | null =
+      directRouteSelection?.upstreamModel
+      ?? (multiRoute
+        ? model ?? null
+        : (typeof requestedModel === 'string' && requestedModel.startsWith('LR/')
+            ? requestedModel.slice(3)
+            : model ?? null));
 
     deps.traceStore.appendEvent(
       buildTraceEvent(requestId, 'responses_request_received', {
         model,
         ...(rawRequestedModel && rawRequestedModel !== model ? { rawRequestedModel } : {}),
+        ...(requestedModel && requestedModel !== model ? { requestedModel } : {}),
         stream,
         ...(typeof (body as Record<string, unknown>).thinking === 'string'
           ? { thinking: (body as Record<string, unknown>).thinking }
@@ -260,7 +287,99 @@ export function createResponsesHandler(deps: ResponsesDeps) {
       });
     }
 
+    function appendRequestCompleted(attempt: number) {
+      deps.traceStore.appendEvent(
+        buildTraceEvent(requestId, 'responses_request_completed', {
+          attempt,
+          model,
+          stream,
+          classification: finalClassification,
+          committed,
+          ...(lastStatus ? { upstreamStatus: lastStatus } : {}),
+          ...(lastProviderId ? { providerId: lastProviderId } : {}),
+          ...(lastRouteId ? { routeId: lastRouteId } : {}),
+        }),
+      );
+    }
+
+    function advanceAliasFallback(nextAttempt: number, reason: string) {
+      if (!multiRoute || multiRouteMemberIndex === null || multiRoute.strategy !== 'round-robin') {
+        return;
+      }
+
+      const nextSelection = rotateRoundRobinRoute(multiRoute, multiRouteMemberIndex);
+      if (!nextSelection) {
+        return;
+      }
+
+      const previousModel = model;
+      multiRouteMemberIndex = nextSelection.memberIndex;
+      model = nextSelection.upstreamModel;
+      body.model = model;
+      lastProviderId = multiRoute.providerId;
+      lastRouteId = multiRoute.id;
+      lastUpstreamModel = model;
+
+      deps.traceStore.appendEvent(
+        buildTraceEvent(requestId, 'responses_alias_model_rotated', {
+          attempt: nextAttempt,
+          requestedModel,
+          routeId: multiRoute.id,
+          previousModel,
+          model,
+          stream,
+          classification: reason,
+        }),
+      );
+    }
+
+    function advanceStickyAliasAfterFailure(attempt: number, reason: string) {
+      if (!multiRoute || multiRouteMemberIndex === null || multiRoute.strategy !== 'sticky-failover') {
+        return;
+      }
+
+      const previousModel = model;
+      const nextSelection = advanceStickyFailoverRoute(multiRoute, multiRouteMemberIndex);
+      if (!nextSelection) {
+        return;
+      }
+
+      deps.traceStore.appendEvent(
+        buildTraceEvent(requestId, 'responses_alias_model_rotated', {
+          attempt,
+          requestedModel,
+          routeId: multiRoute.id,
+          previousModel,
+          model: nextSelection.upstreamModel,
+          stream,
+          classification: reason,
+        }),
+      );
+    }
+
+    function resolveFailoverState() {
+      if (
+        !multiRoute
+        || multiRoute.strategy !== 'sticky-failover'
+        || multiRouteMemberIndex === null
+        || multiRouteMemberIndex <= 0
+      ) {
+        return {
+          used: false,
+          from: null,
+          to: null,
+        };
+      }
+
+      return {
+        used: true,
+        from: multiRoute.members?.[0] ?? null,
+        to: lastUpstreamModel ?? model ?? null,
+      };
+    }
+
     function buildObservability(attempts: number, classification = finalClassification) {
+      const failover = resolveFailoverState();
       return {
         requestId,
         endpoint: 'responses' as const,
@@ -270,9 +389,9 @@ export function createResponsesHandler(deps: ResponsesDeps) {
         upstreamModel: lastUpstreamModel,
         providerId: lastProviderId,
         routeId: lastRouteId,
-        failoverUsed: false,
-        failoverFrom: null,
-        failoverTo: null,
+        failoverUsed: failover.used,
+        failoverFrom: failover.from,
+        failoverTo: failover.to,
       };
     }
 
@@ -295,6 +414,7 @@ export function createResponsesHandler(deps: ResponsesDeps) {
         }),
       );
       recordSummary(0);
+      appendRequestCompleted(0);
       applyQrouterObservabilityHeaders(reply, buildObservability(0, finalClassification));
 
       if (stream) {
@@ -328,7 +448,7 @@ export function createResponsesHandler(deps: ResponsesDeps) {
     if (
       deps.allowedModels &&
       deps.allowedModels.size > 0 &&
-      !buildAllowedModelCandidates(model, rawRequestedModel).some((candidate) =>
+      !buildAllowedModelCandidates(model, requestedModel, rawRequestedModel).some((candidate) =>
         deps.allowedModels?.has(candidate),
       )
     ) {
@@ -400,6 +520,7 @@ export function createResponsesHandler(deps: ResponsesDeps) {
         }),
       );
       recordSummary(attempt);
+      appendRequestCompleted(attempt);
       applyQrouterObservabilityHeaders(reply, buildObservability(attempt));
 
       if (stream) {
@@ -442,6 +563,7 @@ export function createResponsesHandler(deps: ResponsesDeps) {
         }),
       );
       recordSummary(attempt);
+      appendRequestCompleted(attempt);
       applyQrouterObservabilityHeaders(reply, buildObservability(attempt));
       return reply.code(lastStatus ?? 502).send(
         buildTerminalFailure({
@@ -472,8 +594,11 @@ export function createResponsesHandler(deps: ResponsesDeps) {
         lastStatus = upstream.status;
         lastUpstreamError =
           upstream.status >= 400 ? await resolveUpstreamErrorDetails(upstream) : null;
-        lastProviderId = upstream.providerId ?? lastProviderId;
-        lastRouteId = upstream.routeId ?? lastRouteId;
+        lastProviderId = multiRoute?.providerId ?? upstream.providerId ?? lastProviderId;
+        lastRouteId = multiRoute?.id ?? upstream.routeId ?? lastRouteId;
+        lastUpstreamModel = multiRoute
+          ? (typeof model === 'string' && model.length > 0 ? model : lastUpstreamModel)
+          : (directRouteSelection?.upstreamModel ?? lastUpstreamModel);
 
         deps.traceStore.appendEvent(
           buildTraceEvent(requestId, 'responses_upstream_response', {
@@ -518,14 +643,17 @@ export function createResponsesHandler(deps: ResponsesDeps) {
                 classification: finalClassification,
               }),
             );
+            advanceAliasFallback(attempt + 1, finalClassification);
             await sleep(deps.retryPolicy.backoffMs(attempt, finalClassification));
             continue;
           }
 
           if (retryable) {
+            advanceStickyAliasAfterFailure(attempt, finalClassification);
             return returnVisibleFailureReply(attempt);
           }
 
+          advanceStickyAliasAfterFailure(attempt, finalClassification);
           return returnTerminalFailureReply(attempt);
         }
 
@@ -547,10 +675,12 @@ export function createResponsesHandler(deps: ResponsesDeps) {
                   classification: finalClassification,
                 }),
               );
+              advanceAliasFallback(attempt + 1, finalClassification);
               await sleep(deps.retryPolicy.backoffMs(attempt, finalClassification));
               continue;
             }
 
+            advanceStickyAliasAfterFailure(attempt, finalClassification);
             return returnVisibleFailureReply(attempt);
           }
 
@@ -573,11 +703,13 @@ export function createResponsesHandler(deps: ResponsesDeps) {
             committed = true;
             finalClassification = 'semantic_success';
             recordSummary(attempt);
+            appendRequestCompleted(attempt);
           } catch {
             committed = true;
             finalClassification = 'stream_interrupted_after_commit';
             errorClass = 'stream_interrupted_after_commit';
             recordSummary(attempt);
+            appendRequestCompleted(attempt);
           } finally {
             downstream.end();
           }
@@ -607,10 +739,12 @@ export function createResponsesHandler(deps: ResponsesDeps) {
                 classification: finalClassification,
               }),
             );
+            advanceAliasFallback(attempt + 1, finalClassification);
             await sleep(deps.retryPolicy.backoffMs(attempt, finalClassification));
             continue;
           }
 
+          advanceStickyAliasAfterFailure(attempt, finalClassification);
           return returnVisibleFailureReply(attempt);
         }
 
@@ -624,6 +758,7 @@ export function createResponsesHandler(deps: ResponsesDeps) {
         finalClassification = 'semantic_success';
         errorClass = null;
         recordSummary(attempt);
+        appendRequestCompleted(attempt);
         const payloadWithQrouterMetadata = appendResponsesQrouterMetadata(
           payload,
           buildObservability(attempt),
@@ -643,10 +778,12 @@ export function createResponsesHandler(deps: ResponsesDeps) {
         );
 
         if (attempt < deps.retryPolicy.maxAttempts) {
+          advanceAliasFallback(attempt + 1, finalClassification);
           await sleep(deps.retryPolicy.backoffMs(attempt, finalClassification));
           continue;
         }
 
+        advanceStickyAliasAfterFailure(attempt, finalClassification);
         return returnVisibleFailureReply(attempt);
       }
     }

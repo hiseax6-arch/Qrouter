@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, test } from 'vitest';
+import type { RouterRuntimeConfig } from '../config/router.js';
 import { buildApp } from '../server.js';
 import { createNoopTraceStore, createTraceStore, nowTraceTimestamp } from '../traces/store.js';
 
@@ -24,6 +25,24 @@ function streamThatFailsAfterFirstSemanticChunk(errorMessage = 'stream dropped a
     },
   };
 }
+
+const minimalResponsesRuntimeConfig: RouterRuntimeConfig = {
+  configPath: '/tmp/qrouter-test-router.json',
+  server: {
+    host: '127.0.0.1',
+    port: 0,
+  },
+  upstream: {
+    timeoutMs: 45_000,
+  },
+  providers: {},
+  routes: [],
+  models: {
+    allow: ['gpt-5.4'],
+  },
+  thinking: {},
+  traces: {},
+};
 
 describe('POST /v1/chat/completions', () => {
   test('retries empty-success once and returns the later semantic success', async () => {
@@ -301,6 +320,150 @@ describe('POST /v1/chat/completions', () => {
     expect(called).toBe(false);
 
     await app.close();
+  });
+
+  test('emits responses_request_completed for semantic success on /v1/responses', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'Q-router-responses-success-'));
+    const jsonlPath = join(tempDir, 'events.jsonl');
+    const sqlitePath = join(tempDir, 'summaries.sqlite');
+    const traceStore = createTraceStore({ jsonlPath, sqlitePath });
+
+    const app = buildApp({
+      traceStore,
+      routerConfig: minimalResponsesRuntimeConfig,
+      fetchUpstream: async () => ({
+        status: 200,
+        headers: {},
+        providerId: 'codex',
+        routeId: 'codex-main',
+        upstreamUrl: 'https://codex.example.test/v1/responses',
+        json: async () => ({
+          id: 'resp-ok',
+          object: 'response',
+          model: 'gpt-5.4',
+          output: [],
+        }),
+      }),
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'gpt-5.4',
+        input: 'hi',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      id: 'resp-ok',
+      object: 'response',
+    });
+
+    await app.close();
+
+    const jsonl = readFileSync(jsonlPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    expect(jsonl).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event: 'responses_request_received',
+          model: 'gpt-5.4',
+          stream: false,
+        }),
+        expect.objectContaining({ event: 'responses_attempt_started', attempt: 1 }),
+        expect.objectContaining({
+          event: 'responses_upstream_response',
+          status: 200,
+          providerId: 'codex',
+          routeId: 'codex-main',
+          upstreamUrl: 'https://codex.example.test/v1/responses',
+        }),
+        expect.objectContaining({
+          event: 'responses_request_completed',
+          classification: 'semantic_success',
+          committed: false,
+          upstreamStatus: 200,
+          providerId: 'codex',
+          routeId: 'codex-main',
+        }),
+      ]),
+    );
+  });
+
+  test('emits responses_request_completed for terminal failures on /v1/responses', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'Q-router-responses-terminal-'));
+    const jsonlPath = join(tempDir, 'events.jsonl');
+    const sqlitePath = join(tempDir, 'summaries.sqlite');
+    const traceStore = createTraceStore({ jsonlPath, sqlitePath });
+
+    const app = buildApp({
+      traceStore,
+      routerConfig: minimalResponsesRuntimeConfig,
+      fetchUpstream: async () => ({
+        status: 401,
+        headers: {},
+        providerId: 'codex',
+        routeId: 'codex-main',
+        upstreamUrl: 'https://codex.example.test/v1/responses',
+        json: async () => ({
+          error: {
+            type: 'invalid_api_key',
+            message: 'Bad credentials',
+          },
+        }),
+        bodyText: async () => JSON.stringify({
+          error: {
+            type: 'invalid_api_key',
+            message: 'Bad credentials',
+          },
+        }),
+      }),
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'gpt-5.4',
+        input: 'hi',
+      },
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toMatchObject({
+      error: {
+        type: 'upstream_terminal_error',
+        final_error_class: 'http_401',
+      },
+    });
+
+    await app.close();
+
+    const jsonl = readFileSync(jsonlPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    expect(jsonl).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event: 'responses_terminal_failure_returned',
+          classification: 'http_401',
+          upstreamStatus: 401,
+        }),
+        expect.objectContaining({
+          event: 'responses_request_completed',
+          classification: 'http_401',
+          committed: false,
+          upstreamStatus: 401,
+          providerId: 'codex',
+          routeId: 'codex-main',
+        }),
+      ]),
+    );
   });
 
   test('retries 403 usage-limit responses and returns the later semantic success', async () => {

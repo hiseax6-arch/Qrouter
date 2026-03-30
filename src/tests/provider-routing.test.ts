@@ -1726,6 +1726,165 @@ describe('provider-aware upstream routing', () => {
     await app.close();
   });
 
+  test('uses sticky-failover routes on /v1/responses after the active member fails', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        codex: {
+          api: 'openai-responses',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://codex.example.test/v1',
+          models: [
+            {
+              id: 'gpt-5.4',
+              name: 'GPT-5.4',
+            },
+            {
+              id: 'gpt-5.4-mini',
+              name: 'GPT-5.4 Mini',
+            },
+          ],
+        },
+      },
+      routes: [
+        {
+          id: 'codex-failover',
+          provider: 'codex',
+          aliases: ['LR/codex-failover'],
+          strategy: 'sticky-failover',
+          members: ['gpt-5.4', 'gpt-5.4-mini'],
+        },
+      ],
+    });
+
+    chdir(dir);
+    process.env.Q_CODEX_API_KEY = 'codex-secret';
+
+    const fetchSpy = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { model?: string };
+      if (body.model === 'gpt-5.4') {
+        return new Response(
+          JSON.stringify({
+            error: {
+              type: 'server_error',
+              message: 'primary backend unavailable',
+            },
+          }),
+          {
+            status: 503,
+            headers: {
+              'content-type': 'application/json',
+            },
+          },
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          id: 'resp-codex-failover',
+          object: 'response',
+          model: 'gpt-5.4-mini',
+          output: [
+            {
+              type: 'message',
+              role: 'assistant',
+              content: [
+                {
+                  type: 'output_text',
+                  text: 'recovered via secondary responses model',
+                },
+              ],
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+      retryPolicy: {
+        maxAttempts: 2,
+        backoffMs: () => 0,
+      },
+    });
+
+    const failedResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'LR/codex-failover',
+        input: 'hi',
+      },
+    });
+
+    expect(failedResponse.statusCode).toBe(200);
+    expect(failedResponse.json()).toMatchObject({
+      object: 'response',
+      status: 'completed',
+    });
+
+    const recoveredResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'LR/codex-failover',
+        input: 'try secondary',
+      },
+    });
+
+    expect(recoveredResponse.statusCode).toBe(200);
+    expect(recoveredResponse.json()).toMatchObject({
+      id: 'resp-codex-failover',
+      object: 'response',
+      metadata: {
+        qrouter: {
+          requested_model: 'LR/codex-failover',
+          upstream_model: 'gpt-5.4-mini',
+          provider_id: 'codex',
+          route_id: 'codex-failover',
+          failover_used: true,
+          failover_from: 'gpt-5.4',
+          failover_to: 'gpt-5.4-mini',
+        },
+      },
+      output: [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'output_text',
+              text: 'recovered via secondary responses model',
+            },
+          ],
+        },
+      ],
+    });
+    expect(recoveredResponse.headers['x-qrouter-route-id']).toBe('codex-failover');
+    expect(recoveredResponse.headers['x-qrouter-upstream-model']).toBe('gpt-5.4-mini');
+    expect(recoveredResponse.headers['x-qrouter-failover-used']).toBe('true');
+    expect(recoveredResponse.headers['x-qrouter-failover-from']).toBe('gpt-5.4');
+    expect(recoveredResponse.headers['x-qrouter-failover-to']).toBe('gpt-5.4-mini');
+
+    const routedModels = fetchSpy.mock.calls.map((call) => {
+      const [, init] = call as unknown as [string, RequestInit];
+      return JSON.parse(String(init.body)).model as string;
+    });
+    expect(routedModels).toEqual([
+      'gpt-5.4',
+      'gpt-5.4',
+      'gpt-5.4-mini',
+    ]);
+
+    await app.close();
+  });
+
 
   test('adapts raw responses SSE into chat-completions chunks for streaming requests', async () => {
     const dir = writeRouterConfig({

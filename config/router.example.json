@@ -4,13 +4,13 @@
     "port": 4318
   },
   "upstream": {
-    "baseUrl": "https://openrouter.ai/api/v1",
+    "baseUrl": "https://your-upstream-endpoint.example.com/v1",
     "timeoutMs": 300000
   },
   "providers": {
     "openrouter": {
       "api": "openai-completions",
-      "baseUrl": "https://openrouter.ai/api/v1",
+      "baseUrl": "https://your-openrouter-endpoint.example.com/v1",
       "apiKeyEnv": "Q_OPENROUTER_API_KEY",
       "models": [
         {
@@ -31,7 +31,7 @@
       "api": "openai-responses",
       "auth": "api-key",
       "authHeader": true,
-      "baseUrl": "https://codex.0u0o.com/v1",
+      "baseUrl": "https://your-codex-endpoint.example.com/v1",
       "apiKeyEnv": "Q_CODEX_API_KEY",
       "headers": {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) OpenClaw/2026.2.14",
@@ -59,7 +59,7 @@
     },
     "modelscope": {
       "api": "openai-completions",
-      "baseUrl": "https://api-inference.modelscope.cn/v1",
+      "baseUrl": "https://your-modelscope-endpoint.example.com/v1",
       "auth": "api-key",
       "authHeader": true,
       "apiKeyEnv": "Q_MODELSCOPE_API_KEY",

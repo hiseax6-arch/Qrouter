@@ -3,7 +3,7 @@
 ## Scope
 This note audits the current Q-router code structure and summarizes how downstream model IDs are mapped to upstream provider IDs, URLs, credentials, and thinking/reasoning settings.
 
-The findings below are the routing audit snapshot. The repository baseline has since been sanitized to use env-based provider keys in `config/router.json`, with `config/router.local.json` available for local private overrides.
+The findings below are the routing audit snapshot. The repository baseline has since been sanitized to use env-based provider keys. The public repo now tracks `config/router.example.json`, while `config/router.json` / `config/router.local.json` are reserved for local private runtime overrides.
 
 The audit is based on:
 - `config/router.json`

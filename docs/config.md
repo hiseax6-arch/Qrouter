@@ -15,7 +15,8 @@ The current code now supports two config styles:
 - explicit style: `providers` + `routes`
 
 Compatibility rules:
-- existing `config/router.json` keeps working unchanged
+- existing local `config/router.json` keeps working unchanged
+- the public repo ships `config/router.example.json`; copy it to `config/router.local.json` or `config/router.json` before running locally
 - if `config/router.local.json` exists, it is merged on top of `config/router.json` for the current workspace
 - if `routes` is present and `models.allow` is omitted, the allow-list is derived from route aliases
 - provider secrets can now be declared with `apiKeyEnv`
@@ -61,8 +62,8 @@ Suggested env vars:
 Good for stable, non-secret policy settings.
 
 Suggested file path:
-- `config/router.json`
-- `config/router.local.json` for machine-local overrides that should not be committed
+- `config/router.example.json` (committed public template)
+- `config/router.json` or `config/router.local.json` for machine-local runtime config that should not be committed
 
 Suggested contents:
 - endpoint enablement,

@@ -13,6 +13,7 @@ coverage/
 *.sqlite-wal
 *.tsbuildinfo
 config/router.local.json
+config/router.json
 task_plan.md
 findings.md
 progress.md

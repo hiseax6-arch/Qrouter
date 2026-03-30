@@ -11,8 +11,8 @@ Q-router is a local OpenAI-compatible gateway for OpenClaw. It sits between Open
 
 ## Repo Layout
 - `src/`: server, ingress, routing, upstream client, traces, tests
-- `config/router.json`: committed, secret-free baseline config
-- `config/router.local.example.json`: sample for machine-local private overrides
+- `config/router.example.json`: committed public template config
+- `config/router.local.example.json`: minimal secret placeholder example for machine-local private overrides
 - `config/model-mappings.json`: explicit route aliases and thinking mappings
 - `docs/`: architecture, config, operations, and routing audit notes
 - `examples/openclaw.qingfu-router.json5`: example OpenClaw integration patch
@@ -30,7 +30,7 @@ Q-router is a local OpenAI-compatible gateway for OpenClaw. It sits between Open
    ```
 3. Optionally create a local private override file:
    ```bash
-   cp config/router.local.example.json config/router.local.json
+   cp config/router.example.json config/router.local.json
    ```
 4. Start the router:
    ```bash
@@ -42,12 +42,12 @@ Q-router is a local OpenAI-compatible gateway for OpenClaw. It sits between Open
    curl http://127.0.0.1:4318/debug/routes
    ```
 
-When present, `config/router.local.json` is merged on top of `config/router.json`. That file is gitignored and intended for private machine-specific settings.
+The public repository tracks `config/router.example.json` only. Copy it to `config/router.local.json` (or `config/router.json`) before running Q-router. When present, `config/router.local.json` is merged on top of `config/router.json`. That file is gitignored and intended for private machine-specific settings.
 
 ## How Config Works
 Q-router splits model configuration into two layers:
 
-1. `provider` layer in `config/router.json` or `config/router.local.json`
+1. `provider` layer in your local `config/router.local.json` (usually copied from `config/router.example.json`) or `config/router.json`
    - defines the upstream API type, base URL, auth mode, API key env var, and the list of real upstream models
 2. `route` layer in `config/model-mappings.json`
    - defines which request aliases map to which provider/model pair
@@ -69,7 +69,7 @@ Config lookup order:
 2. `config/router.local.json`
 3. `config/router.json`
 
-If `config/router.local.json` exists, it is merged on top of the base config and is the recommended place for machine-local provider overrides.
+If `config/router.local.json` exists, it is merged on top of the base config and is the recommended place for machine-local provider overrides. In a fresh clone, start by copying `config/router.example.json` into a local runtime file.
 
 Fallback behavior:
 - each candidate model gets its own retry budget
@@ -97,7 +97,7 @@ or the header:
 This is the full flow for adding one new OpenAI-compatible `chat/completions` model named `foo-1` from a new provider.
 
 ### 1. Add the provider
-Create or update `config/router.local.json`:
+Create or update `config/router.local.json` (for example by copying `config/router.example.json` first):
 
 ```json
 {

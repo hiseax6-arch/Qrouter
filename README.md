@@ -2,16 +2,16 @@
 
 [English](./README.md) | [简体中文](./README.zh-CN.md) | [繁體中文](./README.zh-TW.md)
 
-Q-router is a local OpenAI-compatible gateway for OpenClaw, designed for users who need stable routing across multiple upstream model providers, especially when relying on unstable or rate-limited third-party services.
+Q-router is a local OpenAI-compatible gateway for OpenClaw, built to improve OpenClaw output stability across multiple upstream model providers, especially when working with unstable, rate-limited, or inconsistent third-party services.
 
 ## Core Capabilities
-- Explicit model routing across multiple upstream providers
-- Automatic retry for transient upstream failures
-- Fallback / failover routing when a provider or model becomes unstable
-- Timed failback to the primary route after recovery
-- Rejection of empty-success responses to avoid blank assistant replies
-- Local trace logging with JSONL and SQLite for debugging and incident review
-- OpenAI-compatible interface for easy integration with OpenClaw and similar tools
+- Improves OpenClaw output stability when upstream providers are rate-limited, unstable, or inconsistent
+- Automatically retries transient upstream failures before returning a bad result to OpenClaw
+- Fails over to backup routes when a model or provider becomes unreliable
+- Fails back to the primary route after recovery, so temporary degradation does not become permanent drift
+- Rejects empty-success or malformed upstream responses to prevent blank assistant outputs
+- Keeps routing explicit across multiple upstream model providers instead of relying on opaque provider-side switching
+- Stores local request traces in JSONL and SQLite for debugging unstable outputs and incident review
 
 ## Who It Is For
 Q-router is a good fit if you:

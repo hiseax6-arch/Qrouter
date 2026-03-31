@@ -2,16 +2,16 @@
 
 [English](./README.md) | [简体中文](./README.zh-CN.md) | [繁體中文](./README.zh-TW.md)
 
-Q-router 是一個給 OpenClaw 用的本地 OpenAI 相容路由閘道，適合需要接入多個上游模型來源，並且要對抗第三方服務不穩定、限流、空回應、偶發失敗等問題的場景。
+Q-router 是一個給 OpenClaw 用的本地 OpenAI 相容路由閘道，核心目標是提高 OpenClaw 在多上游模型來源下的輸出穩定性，尤其適合第三方服務不穩定、限流、返回不一致、偶發失敗的場景。
 
 ## 核心能力
-- 對多個上游 provider 進行明確模型路由
-- 對瞬時失敗進行自動重試
-- 當 provider 或模型不穩定時執行 fallback / failover
-- 主路恢復後按策略自動 failback
-- 拒絕「空回應但狀態成功」的異常結果，避免空白 assistant 輸出
-- 使用 JSONL 與 SQLite 保存本地 trace，方便排障與事故追溯
-- 提供 OpenAI 相容介面，方便整合 OpenClaw 與類似工具
+- 在上游 provider 限流、不穩定、返回不一致時，提高 OpenClaw 的輸出穩定性
+- 對瞬時上游失敗自動重試，盡量避免直接把壞結果返回給 OpenClaw
+- 當某個模型或 provider 不可靠時，自動切換到備援路由
+- 主路恢復後自動切回，避免臨時降級長期固化
+- 拒絕「空回應但狀態成功」或格式異常的返回，防止 OpenClaw 產出空白回覆
+- 在多個上游模型來源之間保持明確路由，而不是依賴黑盒式 provider 內部切換
+- 用 JSONL 和 SQLite 保存本地 trace，方便排查輸出不穩定與事故問題
 
 ## 適合誰
 如果你符合下面幾類情況，Q-router 很適合：

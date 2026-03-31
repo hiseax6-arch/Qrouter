@@ -15,10 +15,27 @@ function resolveVisibleModel(model: string | null | undefined): string {
   return typeof model === 'string' && model.trim().length > 0 ? model : 'qrouter-fallback';
 }
 
+function extractUpstreamHint(args: VisibleFailureArgs): string | null {
+  const message = args.upstreamError?.message?.trim();
+  if (!message) {
+    return null;
+  }
+
+  if (args.upstreamStatus && args.upstreamStatus >= 500) {
+    return null;
+  }
+
+  if (args.finalErrorClass === 'timeout' || args.finalErrorClass === 'connection_error') {
+    return null;
+  }
+
+  return message;
+}
+
 function resolveVisibleReason(args: VisibleFailureArgs): string {
   if (args.finalErrorClass === 'http_429' || args.upstreamStatus === 429) {
-    return args.upstreamError?.message
-      ? `上游模型当前限流或额度已耗尽：${args.upstreamError.message}`
+    return extractUpstreamHint(args)
+      ? `上游模型当前限流或额度已耗尽：${extractUpstreamHint(args)}`
       : '上游模型当前限流或额度已耗尽';
   }
 
@@ -34,8 +51,52 @@ function resolveVisibleReason(args: VisibleFailureArgs): string {
     return '上游模型返回了空响应';
   }
 
-  if (args.finalErrorClass === 'upstream_non_json') {
+  if (args.finalErrorClass === 'upstream_non_json' || args.finalErrorClass === 'malformed_success') {
     return '上游模型返回了异常格式响应';
+  }
+
+  if (args.finalErrorClass === 'missing_stream_body') {
+    return '上游模型流式响应异常中断';
+  }
+
+  if (args.upstreamStatus === 400) {
+    return extractUpstreamHint(args)
+      ? `请求参数不被上游接受（HTTP 400）：${extractUpstreamHint(args)}`
+      : '请求参数不被上游接受（HTTP 400）';
+  }
+
+  if (args.upstreamStatus === 401) {
+    return extractUpstreamHint(args)
+      ? `上游鉴权失败（HTTP 401）：${extractUpstreamHint(args)}`
+      : '上游鉴权失败（HTTP 401）';
+  }
+
+  if (args.upstreamStatus === 403) {
+    return extractUpstreamHint(args)
+      ? `上游拒绝当前请求（HTTP 403）：${extractUpstreamHint(args)}`
+      : '上游拒绝当前请求（HTTP 403）';
+  }
+
+  if (args.upstreamStatus === 404) {
+    return extractUpstreamHint(args)
+      ? `上游模型或接口不存在（HTTP 404）：${extractUpstreamHint(args)}`
+      : '上游模型或接口不存在（HTTP 404）';
+  }
+
+  if (args.upstreamStatus === 408) {
+    return '上游请求超时（HTTP 408）';
+  }
+
+  if (args.upstreamStatus === 409) {
+    return extractUpstreamHint(args)
+      ? `上游请求冲突（HTTP 409）：${extractUpstreamHint(args)}`
+      : '上游请求冲突（HTTP 409）';
+  }
+
+  if (args.upstreamStatus === 422) {
+    return extractUpstreamHint(args)
+      ? `上游无法处理当前请求（HTTP 422）：${extractUpstreamHint(args)}`
+      : '上游无法处理当前请求（HTTP 422）';
   }
 
   if (args.upstreamStatus && args.upstreamStatus >= 500) {
@@ -43,8 +104,8 @@ function resolveVisibleReason(args: VisibleFailureArgs): string {
   }
 
   if (args.upstreamStatus && args.upstreamStatus >= 400) {
-    return args.upstreamError?.message
-      ? `上游模型返回错误（HTTP ${args.upstreamStatus}）：${args.upstreamError.message}`
+    return extractUpstreamHint(args)
+      ? `上游模型返回错误（HTTP ${args.upstreamStatus}）：${extractUpstreamHint(args)}`
       : `上游模型返回错误（HTTP ${args.upstreamStatus}）`;
   }
 

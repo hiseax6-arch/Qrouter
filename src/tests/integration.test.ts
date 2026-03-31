@@ -1021,7 +1021,7 @@ describe('POST /v1/chat/completions', () => {
     expect(response.json()).toMatchObject({
       error: {
         type: 'upstream_terminal_error',
-        message: 'Upstream 403: Plan does not allow this model',
+        message: '上游拒绝当前请求（HTTP 403）：Plan does not allow this model',
         request_id: expect.any(String),
         attempts: 1,
         final_error_class: 'http_403',

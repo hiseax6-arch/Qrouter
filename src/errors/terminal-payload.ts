@@ -54,6 +54,76 @@ export function parseUpstreamErrorDetails(bodyText: string): UpstreamFailureDeta
   };
 }
 
+function extractHintMessage(args: {
+  upstreamStatus?: number | null;
+  upstreamError?: UpstreamFailureDetails | null;
+}): string | null {
+  const message = args.upstreamError?.message?.trim();
+  if (!message) {
+    return null;
+  }
+
+  if (args.upstreamStatus && args.upstreamStatus >= 500) {
+    return null;
+  }
+
+  return message;
+}
+
+function buildStatusAwareMessage(args: {
+  upstreamStatus?: number | null;
+  upstreamError?: UpstreamFailureDetails | null;
+}): string {
+  const hint = extractHintMessage(args);
+  const status = args.upstreamStatus ?? null;
+
+  if (status === 400) {
+    return hint ? `请求参数不被上游接受（HTTP 400）：${hint}` : '请求参数不被上游接受（HTTP 400）';
+  }
+
+  if (status === 401) {
+    return hint ? `上游鉴权失败（HTTP 401）：${hint}` : '上游鉴权失败（HTTP 401）';
+  }
+
+  if (status === 403) {
+    return hint ? `上游拒绝当前请求（HTTP 403）：${hint}` : '上游拒绝当前请求（HTTP 403）';
+  }
+
+  if (status === 404) {
+    return hint ? `上游模型或接口不存在（HTTP 404）：${hint}` : '上游模型或接口不存在（HTTP 404）';
+  }
+
+  if (status === 408) {
+    return '上游请求超时（HTTP 408）';
+  }
+
+  if (status === 409) {
+    return hint ? `上游请求冲突（HTTP 409）：${hint}` : '上游请求冲突（HTTP 409）';
+  }
+
+  if (status === 422) {
+    return hint ? `上游无法处理当前请求（HTTP 422）：${hint}` : '上游无法处理当前请求（HTTP 422）';
+  }
+
+  if (status === 429) {
+    return hint ? `上游服务商限流或额度耗尽（429）：${hint}` : '上游服务商限流或额度耗尽，请稍后重试或切换模型。';
+  }
+
+  if (status && status >= 500) {
+    return `上游模型服务暂时不可用（HTTP ${status}）`;
+  }
+
+  if (hint) {
+    return status ? `上游模型返回错误（HTTP ${status}）：${hint}` : `上游模型异常：${hint}`;
+  }
+
+  if (status) {
+    return `上游模型返回错误（HTTP ${status}）`;
+  }
+
+  return '上游返回不可恢复错误。';
+}
+
 export function buildEmptySuccessFailure(args: {
   requestId: string;
   attempts: number;
@@ -115,9 +185,10 @@ export function buildTerminalFailure(args: {
   upstreamStatus?: number | null;
   upstreamError?: UpstreamFailureDetails | null;
 }) {
-  const message = args.upstreamError?.message
-    ? `Upstream ${args.upstreamStatus ?? 'error'}: ${args.upstreamError.message}`
-    : 'Upstream returned a non-retryable error.';
+  const message = buildStatusAwareMessage({
+    upstreamStatus: args.upstreamStatus,
+    upstreamError: args.upstreamError,
+  });
 
   return {
     error: {

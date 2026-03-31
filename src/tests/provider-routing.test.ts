@@ -563,7 +563,7 @@ describe('provider-aware upstream routing', () => {
       expect(response.json()).toMatchObject({
         error: {
           type: 'upstream_terminal_error',
-          message: 'Upstream returned a non-retryable error.',
+          message: '上游鉴权失败（HTTP 401）',
           request_id: expect.any(String),
           attempts: 1,
           final_error_class: 'http_401',
@@ -642,7 +642,7 @@ describe('provider-aware upstream routing', () => {
     expect(response.json()).toMatchObject({
       error: {
         type: 'upstream_terminal_error',
-        message: 'Upstream 401: Bad credentials',
+        message: '上游鉴权失败（HTTP 401）：Bad credentials',
         request_id: expect.any(String),
         attempts: 1,
         final_error_class: 'http_401',

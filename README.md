@@ -57,7 +57,7 @@ Q-router is especially useful when combining these kinds of upstreams, because f
 - `config/router.example.json`: committed public template config
 - `config/router.local.example.json`: minimal secret placeholder example for machine-local private overrides
 - `config/model-mappings.json`: explicit route aliases and thinking mappings
-- `docs/`: architecture, config, operations, and routing audit notes
+- `docs/`: architecture, config, operations, routing audit notes, and error handling
 - `examples/openclaw.qingfu-router.json5`: example OpenClaw integration patch
 
 ## Quick Start
@@ -121,6 +121,13 @@ Direct provider calls are simple, but you lose:
 - empty-success filtering
 - unified local traces across providers
 
+## Error Handling
+Q-router classifies common upstream failure classes and decides whether to retry, fail over, or return a terminal error. For retryable classes that still exhaust all attempts, it returns an explicit downstream-visible hint instead of ambiguous blank success.
+
+See:
+- `docs/error-handling.md`
+- `docs/operations.md`
+
 ## Commands
 - `npm run dev`: start in watch mode
 - `npm run build`: compile TypeScript into `dist/`
@@ -132,4 +139,5 @@ Direct provider calls are simple, but you lose:
 - `docs/architecture.md`
 - `docs/config.md`
 - `docs/operations.md`
+- `docs/error-handling.md`
 - `docs/model-routing-audit.md`

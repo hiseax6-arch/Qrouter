@@ -2,19 +2,57 @@
 
 [English](./README.md) | [简体中文](./README.zh-CN.md) | [繁體中文](./README.zh-TW.md)
 
-Q-router 是一個面向 OpenClaw 的本地 OpenAI 相容閘道。它位於 OpenClaw 與上游模型提供方之間，明確控制模型路由，並阻止「空回應但狀態成功」的異常結果被當成正常完成返回。
+Q-router 是一個給 OpenClaw 用的本地 OpenAI 相容路由閘道，適合需要接入多個上游模型來源，並且要對抗第三方服務不穩定、限流、空回應、偶發失敗等問題的場景。
 
-## 它能做什麼
-- 轉發 `chat/completions` 與面向 provider 的 `responses` 請求
-- 在提交失敗前做暫態重試
-- 拒絕空成功回應，避免返回空白 assistant 輸出
-- 將請求軌跡保存到 JSONL 與 SQLite，方便事故追溯
-- 透過 `/health` 與 `/debug/routes` 暴露實際生效的路由資訊
+## 核心能力
+- 對多個上游 provider 進行明確模型路由
+- 對瞬時失敗進行自動重試
+- 當 provider 或模型不穩定時執行 fallback / failover
+- 主路恢復後按策略自動 failback
+- 拒絕「空回應但狀態成功」的異常結果，避免空白 assistant 輸出
+- 使用 JSONL 與 SQLite 保存本地 trace，方便排障與事故追溯
+- 提供 OpenAI 相容介面，方便整合 OpenClaw 與類似工具
+
+## 適合誰
+如果你符合下面幾類情況，Q-router 很適合：
+- 本地執行 OpenClaw 或類似工具
+- 需要在多個模型來源之間切換或路由
+- 經常依賴免費額度、社群介面、或不穩定的第三方服務商
+- 希望自己控制重試、fallback 鏈與路由行為
+- 需要本地證據鏈來排查上游失敗問題
+
+## 不太適合誰
+如果你屬於下面這些情況，Q-router 可能沒有必要：
+- 只使用一個穩定 provider
+- 不需要路由控制或 fallback 機制
+- 不在意空回應過濾或本地除錯 trace
+
+## 推薦的免費 / 低成本 API 來源
+如果你剛開始用 Q-router，下面兩個上游很適合作為起點：
+
+### OpenRouter
+- 模型覆蓋面廣
+- 適合快速測試多個 provider
+- 適合做免費或低成本模型實驗
+- 具體可用性和額度會隨模型變化
+
+### ModelScope（魔塔社區）
+- 適合中國大陸可存取場景
+- 適合試用多個開放模型或社群介面
+- 適合作為 OpenRouter 之外的第二上游來源
+
+Q-router 在這類來源組合下特別有價值，因為免費或社群介面往往更容易出現限流、不穩定、返回品質不一致等問題，而 Q-router 可以用自動重試、failover 和 failback 吸收一部分波動。
+
+## 典型使用場景
+- 把多個免費或低成本模型 API 聚合到一個本地入口
+- 用重試 + fallback + failback 緩衝不穩定上游
+- 讓 OpenClaw 的模型路由保持本地可控、明確透明
+- 排查間歇性空回應、格式錯誤、或異常成功返回
 
 ## 倉庫結構
 - `src/`：服務端、入口、路由、上游客戶端、trace、測試
 - `config/router.example.json`：公開提交的模板配置
-- `config/router.local.example.json`：本機私有覆蓋的最小示例
+- `config/router.local.example.json`：本機私有覆蓋示例
 - `config/model-mappings.json`：明確別名、路由與 thinking 映射
 - `docs/`：架構、配置、運維與路由審計文件
 - `examples/openclaw.qingfu-router.json5`：OpenClaw 整合示例補丁
@@ -24,7 +62,7 @@ Q-router 是一個面向 OpenClaw 的本地 OpenAI 相容閘道。它位於 Open
    ```bash
    npm install
    ```
-2. 設定上游 provider 的環境變數：
+2. 設定 provider 的環境變數：
    ```bash
    export Q_OPENROUTER_API_KEY=replace-me
    export Q_CODEX_API_KEY=replace-me
@@ -52,21 +90,22 @@ Q-router 將模型配置拆成兩層：
 1. `provider` 層：通常放在本地 `config/router.local.json`（可從 `config/router.example.json` 複製）或本地 `config/router.json`
    - 定義上游 API 類型、base URL、認證方式、API key 環境變數，以及真實模型列表
 2. `route` 層：放在 `config/model-mappings.json`
-   - 定義呼叫側別名如何映射到 provider/model
-   - 也可定義 fallback 鏈與池化策略
+   - 定義呼叫別名如何映射到 provider / model
+   - 也可以定義 fallback 鏈與池化策略
 
 配置查找順序：
 1. `Q_ROUTER_CONFIG_PATH`
 2. `config/router.local.json`
 3. `config/router.json`
 
-## 新增一個模型
-完整說明保留在英文 README 與 `docs/config.md`。最短路徑是：
-1. 在本地 `config/router.local.json` 中新增 provider 與模型
-2. 在 `config/model-mappings.json` 中新增 route alias
-3. 匯出對應 API key 環境變數
-4. 重新啟動 Q-router
-5. 用 `/debug/routes` 驗證生效路由
+如果存在 `config/router.local.json`，它會覆蓋基礎配置，是放置本機私有 provider 覆蓋項的建議位置。
+
+## 為什麼不直接連 provider
+直接請求 provider 雖然簡單，但你會失去：
+- 統一的自動重試編排
+- 明確的 fallback / failover / failback 控制
+- 空成功回應過濾
+- 跨 provider 的統一本地 trace 證據鏈
 
 ## 常用命令
 - `npm run dev`：開發模式啟動
@@ -80,5 +119,3 @@ Q-router 將模型配置拆成兩層：
 - `docs/config.md`
 - `docs/operations.md`
 - `docs/model-routing-audit.md`
-
-如果你想先看完整英文原版，再對照中文，建議從 `README.md` 開始。

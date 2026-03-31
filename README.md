@@ -2,14 +2,52 @@
 
 [English](./README.md) | [简体中文](./README.zh-CN.md) | [繁體中文](./README.zh-TW.md)
 
-Q-router is a local OpenAI-compatible gateway for OpenClaw. It sits between OpenClaw and upstream providers, keeps model routing explicit, and prevents empty or malformed upstream "success" payloads from being returned as normal completions.
+Q-router is a local OpenAI-compatible gateway for OpenClaw, designed for users who need stable routing across multiple upstream model providers, especially when relying on unstable or rate-limited third-party services.
 
-## What It Does
-- forwards `chat/completions` and provider-aware `responses` traffic
-- retries transient failures before commit
-- rejects empty-success responses instead of returning blank assistant output
-- keeps request traces in JSONL and SQLite for incident review
-- exposes effective route metadata through `/health` and `/debug/routes`
+## Core Capabilities
+- Explicit model routing across multiple upstream providers
+- Automatic retry for transient upstream failures
+- Fallback / failover routing when a provider or model becomes unstable
+- Timed failback to the primary route after recovery
+- Rejection of empty-success responses to avoid blank assistant replies
+- Local trace logging with JSONL and SQLite for debugging and incident review
+- OpenAI-compatible interface for easy integration with OpenClaw and similar tools
+
+## Who It Is For
+Q-router is a good fit if you:
+- run OpenClaw or similar tools locally
+- need to route across multiple model sources
+- often rely on free-tier or unstable third-party APIs
+- want stronger control over retries, fallback chains, and route behavior
+- need local traces for debugging upstream failures
+
+## Who It Is Not For
+Q-router may be unnecessary if you:
+- only use one stable provider
+- do not need routing control or fallback behavior
+- do not care about empty-response filtering or local debug traces
+
+## Recommended Free / Low-Cost API Sources
+If you are getting started with Q-router, these upstream sources are commonly useful:
+
+### OpenRouter
+- Broad model selection
+- Good for quickly testing multiple providers through one endpoint
+- Useful when you want fast experimentation with free or low-cost models
+- Availability and quotas may vary by model
+
+### ModelScope (魔塔社区)
+- Useful for China-based users or users who prefer domestic-accessible model endpoints
+- Suitable for trying multiple open models with community-oriented access
+- A practical option when you want an additional upstream source beyond OpenRouter
+
+Q-router is especially useful when combining these kinds of upstreams, because free or community endpoints are often rate-limited, unstable, or inconsistent in response quality.
+
+## Typical Use Cases
+- Aggregating multiple free or low-cost model APIs behind one local endpoint
+- Stabilizing unstable upstream providers with retry + fallback + failback
+- Keeping OpenClaw model routing fully local and explicit
+- Debugging intermittent empty or malformed upstream responses
 
 ## Repo Layout
 - `src/`: server, ingress, routing, upstream client, traces, tests
@@ -38,7 +76,7 @@ Q-router is a local OpenAI-compatible gateway for OpenClaw. It sits between Open
    ```bash
    npm run dev
    ```
-5. Verify the effective config:
+5. Verify effective config:
    ```bash
    curl http://127.0.0.1:4318/health
    curl http://127.0.0.1:4318/debug/routes
@@ -50,205 +88,35 @@ The public repository tracks `config/router.example.json` only. Copy it to `conf
 Q-router splits model configuration into two layers:
 
 1. `provider` layer in your local `config/router.local.json` (usually copied from `config/router.example.json`) or `config/router.json`
-   - defines the upstream API type, base URL, auth mode, API key env var, and the list of real upstream models
+   - defines upstream API type, base URL, auth mode, API key env var, and the list of real upstream models
 2. `route` layer in `config/model-mappings.json`
    - defines which request aliases map to which provider/model pair
    - can also define fallback aliases and pool strategies
 
 In practice:
-- `api` decides the upstream protocol:
+- `api` decides upstream protocol:
   - `openai-completions` -> `<baseUrl>/chat/completions`
   - `openai-responses` -> `<baseUrl>/responses`
 - `baseUrl` is the upstream root URL
 - `apiKeyEnv` is the preferred way to bind secrets
-- `routes[*].aliases` are the model names callers use
-- `routes[*].provider` + `routes[*].model` decide the actual upstream target
-- `routes[*].fallbacks` defines the preferred candidate order after the primary route exhausts its retry budget
-- `routes[*].failbackAfterMs` lets a `sticky-failover` route return to its primary member after a cooldown
+- `routes[*].aliases` are caller-facing model names
+- `routes[*].provider` + `routes[*].model` decide actual upstream target
+- `routes[*].fallbacks` define candidate order after primary retry budget is exhausted
+- `routes[*].failbackAfterMs` lets a `sticky-failover` route return to its primary member after cooldown
 
 Config lookup order:
 1. `Q_ROUTER_CONFIG_PATH`
 2. `config/router.local.json`
 3. `config/router.json`
 
-If `config/router.local.json` exists, it is merged on top of the base config and is the recommended place for machine-local provider overrides. In a fresh clone, start by copying `config/router.example.json` into a local runtime file.
+If `config/router.local.json` exists, it is merged on top of the base config and is the recommended place for machine-local provider overrides.
 
-Fallback behavior:
-- each candidate model gets its own retry budget
-- when one candidate exhausts its budget, Q-router moves to the next alias in `fallbacks`
-- newly added routes are automatically appended to the default fallback chain if you do not specify a full list manually
-- `sticky-failover` routes remember the active member across requests, but now support timed failback to the first member
-
-If a request must never leave the originally requested model, send either:
-
-```json
-{
-  "qrouter": {
-    "noFallback": true
-  }
-}
-```
-
-or the header:
-
-```bash
--H 'x-qrouter-no-fallback: true'
-```
-
-## Add A Model
-This is the full flow for adding one new OpenAI-compatible `chat/completions` model named `foo-1` from a new provider.
-
-### 1. Add the provider
-Create or update `config/router.local.json` (for example by copying `config/router.example.json` first):
-
-```json
-{
-  "providers": {
-    "myprovider": {
-      "api": "openai-completions",
-      "baseUrl": "https://api.example.com/v1",
-      "apiKeyEnv": "Q_MYPROVIDER_API_KEY",
-      "auth": "api-key",
-      "authHeader": true,
-      "models": [
-        {
-          "id": "foo-1",
-          "name": "Foo 1",
-          "contextWindow": 128000,
-          "maxTokens": 16000
-        }
-      ]
-    }
-  }
-}
-```
-
-### 2. Add the route alias
-Update `config/model-mappings.json`:
-
-```json
-{
-  "routes": [
-    {
-      "id": "myprovider-foo-1",
-      "provider": "myprovider",
-      "aliases": [
-        "LR/foo-1",
-        "foo-1",
-        "myprovider/foo-1"
-      ],
-      "model": "foo-1"
-    }
-  ]
-}
-```
-
-If you want automatic fallback, add `fallbacks`:
-
-```json
-{
-  "id": "myprovider-foo-1",
-  "provider": "myprovider",
-  "aliases": ["LR/foo-1", "foo-1", "myprovider/foo-1"],
-  "fallbacks": ["LR/stepfun/step-3.5-flash:free"],
-  "model": "foo-1"
-}
-```
-
-If the route is a sticky pool and you want it to return to its primary member after a cooldown, add `failbackAfterMs`:
-
-```json
-{
-  "id": "myprovider-pool",
-  "provider": "myprovider",
-  "aliases": ["LR/foo-pool"],
-  "strategy": "sticky-failover",
-  "members": ["foo-1", "foo-1-mini"],
-  "failbackAfterMs": 300000
-}
-```
-
-### 3. Export the API key
-```bash
-export Q_MYPROVIDER_API_KEY=replace-me
-```
-
-### 4. Restart the router
-```bash
-npm run dev
-```
-
-### 5. Verify the effective route
-```bash
-curl http://127.0.0.1:4318/debug/routes
-```
-
-You should see:
-- `providerId: "myprovider"`
-- `providerApi: "openai-completions"`
-- `upstreamEndpoint: "https://api.example.com/v1/chat/completions"`
-- aliases including `LR/foo-1` and `foo-1`
-
-### 6. Send a test request
-```bash
-curl http://127.0.0.1:4318/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{
-    "model": "foo-1",
-    "messages": [
-      { "role": "user", "content": "Say hello." }
-    ]
-  }'
-```
-
-To force this request to stay on the originally requested model only:
-
-```bash
-curl http://127.0.0.1:4318/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -H 'x-qrouter-no-fallback: true' \
-  -d '{
-    "model": "foo-1",
-    "messages": [
-      { "role": "user", "content": "Say hello." }
-    ]
-  }'
-```
-
-If the provider uses the OpenAI Responses API instead, keep the same route pattern but change the provider config:
-
-```json
-{
-  "providers": {
-    "myresponses": {
-      "api": "openai-responses",
-      "baseUrl": "https://responses.example.com/v1",
-      "apiKeyEnv": "Q_MYRESPONSES_API_KEY",
-      "auth": "api-key",
-      "authHeader": true,
-      "models": [
-        {
-          "id": "bar-1",
-          "name": "Bar 1"
-        }
-      ]
-    }
-  }
-}
-```
-
-The matching route still looks the same:
-
-```json
-{
-  "id": "myresponses-bar-1",
-  "provider": "myresponses",
-  "aliases": ["LR/bar-1", "bar-1", "myresponses/bar-1"],
-  "model": "bar-1"
-}
-```
-
-Q-router will then send that route to `<baseUrl>/responses` automatically.
+## Why Not Direct Provider Access
+Direct provider calls are simple, but you lose:
+- unified retry orchestration
+- explicit fallback/failover/failback control
+- empty-success filtering
+- unified local traces across providers
 
 ## Commands
 - `npm run dev`: start in watch mode

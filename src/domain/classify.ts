@@ -1,5 +1,5 @@
 export type SemanticClassification =
-  | { kind: 'semantic_success'; reason: 'text' | 'tool_call' | 'refusal' }
+  | { kind: 'semantic_success'; reason: 'text' | 'tool_call' | 'refusal' | 'audio' }
   | { kind: 'empty_success'; reason: 'no_semantic_payload'; retryable: true };
 
 type ChatCompletionSemanticCarrier = {
@@ -7,6 +7,12 @@ type ChatCompletionSemanticCarrier = {
   content?: unknown;
   refusal?: unknown;
   tool_calls?: Array<unknown>;
+  audio?: {
+    data?: unknown;
+    format?: unknown;
+    voice?: unknown;
+    transcript?: unknown;
+  } | null;
 };
 
 type ChatCompletionChoice = {
@@ -44,6 +50,17 @@ function hasTextContent(content: unknown): boolean {
   return false;
 }
 
+function hasAudioPayload(audio: ChatCompletionSemanticCarrier['audio']): boolean {
+  if (!audio || typeof audio !== 'object') {
+    return false;
+  }
+
+  return hasNonEmptyString(audio.data)
+    || hasNonEmptyString(audio.transcript)
+    || hasNonEmptyString(audio.format)
+    || hasNonEmptyString(audio.voice);
+}
+
 function classifySemanticCarrier(
   carrier?: ChatCompletionSemanticCarrier,
 ): SemanticClassification | null {
@@ -57,6 +74,10 @@ function classifySemanticCarrier(
 
   if (hasTextContent(carrier.content)) {
     return { kind: 'semantic_success', reason: 'text' };
+  }
+
+  if (hasAudioPayload(carrier.audio)) {
+    return { kind: 'semantic_success', reason: 'audio' };
   }
 
   if (hasNonEmptyString(carrier.refusal)) {

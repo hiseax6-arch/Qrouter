@@ -83,6 +83,17 @@
         "Qwen/Qwen3-235B-A22B",
         "moonshotai/Kimi-K2.5"
       ]
+    },
+    {
+      "id": "mimo-tts",
+      "provider": "mimo",
+      "aliases": [
+        "tts",
+        "LR/tts",
+        "mimo-v2-tts",
+        "mimo/mimo-v2-tts"
+      ],
+      "model": "mimo-v2-tts"
     }
   ],
   "thinking": {

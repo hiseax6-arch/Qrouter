@@ -8,6 +8,9 @@
     },
     "modelscope": {
       "apiKey": "replace-with-modelscope-key"
+    },
+    "mimo": {
+      "apiKey": "replace-with-mimo-key"
     }
   }
 }

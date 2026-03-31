@@ -89,6 +89,23 @@
           "maxTokens": 32000
         }
       ]
+    },
+    "mimo": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.xiaomimimo.com/v1",
+      "auth": "api-key",
+      "authHeader": false,
+      "apiKeyEnv": "Q_MIMO_API_KEY",
+      "models": [
+        {
+          "id": "mimo-v2-tts",
+          "name": "MiMo V2 TTS",
+          "input": [
+            "text"
+          ],
+          "maxTokens": 16000
+        }
+      ]
     }
   },
   "traces": {

@@ -23,6 +23,7 @@ const envKeys = [
   'Q_CUSTOM_API_KEY',
   'Q_OPENROUTER_API_KEY',
   'Q_MODELSCOPE_API_KEY',
+  'Q_MIMO_API_KEY',
 ];
 const originalFetch = globalThis.fetch;
 const modelScopePool = [
@@ -31,6 +32,8 @@ const modelScopePool = [
   'Qwen/Qwen3-235B-A22B',
   'moonshotai/Kimi-K2.5',
 ] as const;
+
+const mimoTtsModel = 'mimo-v2-tts' as const;
 
 function writeRouterConfig(config: unknown, mappings?: unknown): string {
   const dir = mkdtempSync(join(tmpdir(), 'Q-router-provider-'));
@@ -3452,6 +3455,206 @@ describe('provider-aware upstream routing', () => {
     });
     expect((response.json() as { error: { estimated_input_tokens: number } }).error.estimated_input_tokens).toBeGreaterThan(10);
     expect(fetchSpy).not.toHaveBeenCalled();
+
+    await app.close();
+  });
+
+  test('routes mimo tts via x-api-key auth and accepts audio-only success payloads', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        mimo: {
+          api: 'openai-completions',
+          auth: 'api-key',
+          authHeader: false,
+          baseUrl: 'https://api.xiaomimimo.com/v1',
+          models: [
+            {
+              id: mimoTtsModel,
+              name: 'MiMo V2 TTS',
+            },
+          ],
+        },
+      },
+      routes: [
+        {
+          id: 'mimo-tts',
+          provider: 'mimo',
+          aliases: ['tts', 'LR/tts', 'mimo-v2-tts'],
+          model: mimoTtsModel,
+        },
+      ],
+      models: {
+        allow: ['tts', 'LR/tts', 'mimo-v2-tts'],
+      },
+    });
+
+    chdir(dir);
+    process.env.Q_MIMO_API_KEY = 'mimo-secret';
+
+    const fetchSpy = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'resp-mimo-tts',
+          choices: [
+            {
+              message: {
+                role: 'assistant',
+                audio: {
+                  data: 'UklGRlQAAABXQVZFZm10',
+                  format: 'wav',
+                  voice: 'mimo_default',
+                },
+              },
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'tts',
+        messages: [
+          { role: 'assistant', content: 'Hello from MiMo TTS.' },
+        ],
+        audio: {
+          format: 'wav',
+          voice: 'mimo_default',
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      id: 'resp-mimo-tts',
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            audio: {
+              data: 'UklGRlQAAABXQVZFZm10',
+              format: 'wav',
+              voice: 'mimo_default',
+            },
+          },
+        },
+      ],
+    });
+
+    const [url, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('https://api.xiaomimimo.com/v1/chat/completions');
+    expect(init.headers).toMatchObject({
+      'x-api-key': 'mimo-secret',
+    });
+    expect((init.headers as Record<string, string>).authorization).toBeUndefined();
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      model: mimoTtsModel,
+      audio: {
+        format: 'wav',
+        voice: 'mimo_default',
+      },
+    });
+
+    await app.close();
+  });
+
+  test('streams mimo tts chunks without treating audio deltas as empty success', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        mimo: {
+          api: 'openai-completions',
+          auth: 'api-key',
+          authHeader: false,
+          baseUrl: 'https://api.xiaomimimo.com/v1',
+          models: [
+            {
+              id: mimoTtsModel,
+              name: 'MiMo V2 TTS',
+            },
+          ],
+        },
+      },
+      routes: [
+        {
+          id: 'mimo-tts',
+          provider: 'mimo',
+          aliases: ['tts', 'LR/tts', 'mimo-v2-tts'],
+          model: mimoTtsModel,
+        },
+      ],
+      models: {
+        allow: ['tts', 'LR/tts', 'mimo-v2-tts'],
+      },
+    });
+
+    chdir(dir);
+    process.env.Q_MIMO_API_KEY = 'mimo-secret';
+
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            'data: {"id":"resp-mimo-tts-stream","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","audio":{"data":"YXVkaW8tY2h1bmstMQ==","format":"pcm16","voice":"default_en"}}}]}\n\n',
+          ),
+        );
+        controller.enqueue(
+          encoder.encode(
+            'data: {"id":"resp-mimo-tts-stream","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+          ),
+        );
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+      },
+    });
+
+    const fetchSpy = vi.fn(async () => {
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          'content-type': 'text/event-stream; charset=utf-8',
+        },
+      });
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'tts',
+        stream: true,
+        messages: [
+          { role: 'assistant', content: '<style>Happy</style>Hello streaming TTS.' },
+        ],
+        audio: {
+          format: 'pcm16',
+          voice: 'default_en',
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain('YXVkaW8tY2h1bmstMQ==');
+    expect(response.body).toContain('data: [DONE]');
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
 
     await app.close();
   });

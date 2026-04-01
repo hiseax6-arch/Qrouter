@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { chdir, cwd } from 'node:process';
@@ -368,7 +368,11 @@ describe('router config file', () => {
 
     const runtime = loadRouterRuntimeConfig();
 
-    expect(runtime.configPath).toBe(join(originalCwd, 'config', 'router.json'));
+    expect(runtime.configPath).toBe(join(
+      originalCwd,
+      'config',
+      existsSync(join(originalCwd, 'config', 'router.local.json')) ? 'router.local.json' : 'router.json',
+    ));
     expect(runtime.models.allow.length).toBeGreaterThan(0);
   });
 

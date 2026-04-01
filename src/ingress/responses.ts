@@ -197,6 +197,10 @@ function classifyThrownUpstreamError(error: unknown): 'timeout' | 'connection_er
   return 'connection_error';
 }
 
+function shouldAdvanceTerminalCandidate(status: number): boolean {
+  return status === 401 || status === 403 || status === 404;
+}
+
 async function* appendQrouterMetadataToResponsesStream(
   textStream: AsyncIterable<string>,
   buildObservability: () => Parameters<typeof appendResponsesQrouterMetadata>[1],
@@ -515,6 +519,55 @@ export function createResponsesHandler(deps: ResponsesDeps) {
       return false;
     }
 
+    function maybeAdvanceTerminalCandidate(nextAttempt: number, reason: string): boolean {
+      if (requestRoutingControls.disableFallback) {
+        return false;
+      }
+
+      if (advanceCurrentMultiRouteMember(nextAttempt, reason)) {
+        candidateAttempt = 0;
+        return true;
+      }
+
+      while (fallbackAliasCursor < fallbackAliases.length) {
+        const fallbackAlias = fallbackAliases[fallbackAliasCursor++];
+        const previousModel = model;
+        if (!applyRouteTarget(fallbackAlias)) {
+          continue;
+        }
+
+        fallbackActivated = true;
+        candidateAttempt = 0;
+        resetCurrentRouteMemberTracking();
+        deps.traceStore.appendEvent(
+          buildTraceEvent(requestId, 'responses_fallback_route_activated', {
+            attempt: nextAttempt,
+            requestedModel,
+            routeId: primaryRoute?.id,
+            fallbackAlias,
+            previousModel,
+            model,
+            stream,
+            classification: reason,
+          }),
+        );
+        return true;
+      }
+
+      fallbackChainExhausted = true;
+      deps.traceStore.appendEvent(
+        buildTraceEvent(requestId, 'responses_fallback_chain_exhausted', {
+          attempt: nextAttempt - 1,
+          requestedModel,
+          routeId: primaryRoute?.id,
+          model,
+          stream,
+          classification: reason,
+        }),
+      );
+      return false;
+    }
+
     function resolveFailoverState() {
       if (fallbackActivated) {
         return {
@@ -723,6 +776,9 @@ export function createResponsesHandler(deps: ResponsesDeps) {
     }
 
     function returnTerminalFailureReply(attempt: number) {
+      if (lastStatus === 401) {
+        return returnVisibleFailureReply(attempt);
+      }
       committed = false;
       deps.traceStore.appendEvent(
         buildTraceEvent(requestId, 'responses_terminal_failure_returned', {
@@ -828,6 +884,10 @@ export function createResponsesHandler(deps: ResponsesDeps) {
               continue;
             }
             return returnVisibleFailureReply(attempt);
+          }
+
+          if (shouldAdvanceTerminalCandidate(upstream.status) && maybeAdvanceTerminalCandidate(attempt + 1, finalClassification)) {
+            continue;
           }
 
           return returnTerminalFailureReply(attempt);

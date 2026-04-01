@@ -157,6 +157,10 @@ function classifyThrownUpstreamError(error: unknown): 'timeout' | 'connection_er
   return 'connection_error';
 }
 
+function shouldAdvanceTerminalCandidate(status: number): boolean {
+  return status === 401 || status === 403 || status === 404;
+}
+
 function isStreamingRequest(body: ChatCompletionsRequestBody): boolean {
   return body.stream === true;
 }
@@ -486,6 +490,7 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
       : resolveDirectRoute(requestedModel, deps.routes ?? []);
     const primaryRoute = multiRoute ?? directRouteSelection?.route ?? null;
     let fallbackActivated = false;
+    let failoverNoticeActivated = false;
     const fallbackAliases = [...(primaryRoute?.fallbackAliases ?? [])];
     let fallbackAliasCursor = 0;
     let fallbackChainExhausted = false;
@@ -594,6 +599,7 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
           classification: reason,
         }),
       );
+      failoverNoticeActivated = true;
       return true;
     }
 
@@ -628,6 +634,57 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
         }
 
         fallbackActivated = true;
+        failoverNoticeActivated = true;
+        candidateAttempt = 0;
+        resetCurrentRouteMemberTracking();
+        deps.traceStore.appendEvent(
+          buildTraceEvent(requestId, 'fallback_route_activated', {
+            attempt: nextAttempt,
+            requestedModel,
+            routeId: primaryRoute?.id,
+            fallbackAlias,
+            previousModel,
+            model,
+            stream,
+            classification: reason,
+          }),
+        );
+        return true;
+      }
+
+      fallbackChainExhausted = true;
+      deps.traceStore.appendEvent(
+        buildTraceEvent(requestId, 'fallback_chain_exhausted', {
+          attempt: nextAttempt - 1,
+          requestedModel,
+          routeId: primaryRoute?.id,
+          model,
+          stream,
+          classification: reason,
+        }),
+      );
+      return false;
+    }
+
+    function maybeAdvanceTerminalCandidate(nextAttempt: number, reason: string): boolean {
+      if (requestRoutingControls.disableFallback) {
+        return false;
+      }
+
+      if (advanceCurrentMultiRouteMember(nextAttempt, reason)) {
+        candidateAttempt = 0;
+        return true;
+      }
+
+      while (fallbackAliasCursor < fallbackAliases.length) {
+        const fallbackAlias = fallbackAliases[fallbackAliasCursor++];
+        const previousModel = model;
+        if (!applyRouteTarget(fallbackAlias)) {
+          continue;
+        }
+
+        fallbackActivated = true;
+        failoverNoticeActivated = true;
         candidateAttempt = 0;
         resetCurrentRouteMemberTracking();
         deps.traceStore.appendEvent(
@@ -749,19 +806,7 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
         return null;
       }
 
-      if (fallbackActivated) {
-        return buildFailoverNotice({
-          requestedModel: visibleResponseModel,
-          activeModel: model,
-        });
-      }
-
-      if (
-        !multiRoute
-        || multiRoute.strategy !== 'sticky-failover'
-        || multiRouteMemberIndex === null
-        || multiRouteMemberIndex <= 0
-      ) {
+      if (!failoverNoticeActivated) {
         return null;
       }
 
@@ -953,6 +998,9 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
     }
 
     function returnTerminalFailureReply(attempt: number) {
+      if (lastStatus === 401) {
+        return returnVisibleFailureReply(attempt);
+      }
       committed = false;
       deps.traceStore.appendEvent(
         buildTraceEvent(requestId, 'terminal_failure_returned', {
@@ -1264,6 +1312,9 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
 
         finalClassification = `http_${upstream.status}`;
         errorClass = finalClassification;
+        if (shouldAdvanceTerminalCandidate(upstream.status) && maybeAdvanceTerminalCandidate(attempt + 1, finalClassification)) {
+          continue;
+        }
         return returnTerminalFailureReply(attempt);
       } catch (error) {
         finalClassification = classifyThrownUpstreamError(error);

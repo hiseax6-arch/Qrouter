@@ -106,6 +106,7 @@ In practice:
 - `routes[*].provider` + `routes[*].model` decide actual upstream target
 - `routes[*].fallbacks` define candidate order after primary retry budget is exhausted
 - `routes[*].failbackAfterMs` lets a `sticky-failover` route return to its primary member after cooldown
+- upstream `401` responses are surfaced as readable assistant-visible failures instead of raw HTTP errors
 
 Config lookup order:
 1. `Q_ROUTER_CONFIG_PATH`

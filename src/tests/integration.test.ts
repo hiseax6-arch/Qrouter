@@ -394,7 +394,7 @@ describe('POST /v1/chat/completions', () => {
     );
   });
 
-  test('emits responses_request_completed for terminal failures on /v1/responses', async () => {
+  test('emits responses_request_completed for readable 401 failures on /v1/responses', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'Q-router-responses-terminal-'));
     const jsonlPath = join(tempDir, 'events.jsonl');
     const sqlitePath = join(tempDir, 'summaries.sqlite');
@@ -433,12 +433,21 @@ describe('POST /v1/chat/completions', () => {
       },
     });
 
-    expect(response.statusCode).toBe(401);
+    expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({
-      error: {
-        type: 'upstream_terminal_error',
-        final_error_class: 'http_401',
-      },
+      object: 'response',
+      status: 'completed',
+      output: [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'output_text',
+              text: expect.stringContaining('上游鉴权失败（HTTP 401）：Bad credentials'),
+            },
+          ],
+        },
+      ],
     });
 
     await app.close();
@@ -450,14 +459,14 @@ describe('POST /v1/chat/completions', () => {
     expect(jsonl).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          event: 'responses_terminal_failure_returned',
+          event: 'responses_visible_failure_returned',
           classification: 'http_401',
           upstreamStatus: 401,
         }),
         expect.objectContaining({
           event: 'responses_request_completed',
           classification: 'http_401',
-          committed: false,
+          committed: true,
           upstreamStatus: 401,
           providerId: 'codex',
           routeId: 'codex-main',

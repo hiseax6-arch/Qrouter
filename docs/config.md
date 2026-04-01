@@ -146,6 +146,7 @@ Current runtime behavior:
 - retry budget is applied per candidate model, not once for the whole request
 - after one candidate exhausts its budget, the router advances to the next alias in `fallbacks`
 - if `fallbacks` is omitted, Q-router appends the other known routes as a default candidate chain
+- upstream `401` responses are converted into readable assistant-visible failures so callers do not only see raw HTTP error text
 
 Request-level override:
 - body:

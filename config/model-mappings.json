@@ -94,11 +94,21 @@
         "mimo/mimo-v2-tts"
       ],
       "model": "mimo-v2-tts"
+    },
+    {
+      "id": "custom-main",
+      "provider": "custom",
+      "implicitAliases": false,
+      "aliases": [
+        "custom/gpt-5.4",
+        "LR/custom/gpt-5.4"
+      ],
+      "model": "gpt-5.4"
     }
   ],
   "thinking": {
     "defaultMode": "pass-through",
-    "mappingsEnabled": false,
+    "mappingsEnabled": true,
     "mappings": [
       {
         "match": [

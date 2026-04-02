@@ -115,6 +115,7 @@ function defaultExplicitRouteId(route: RouterRouteConfig, index: number): string
 function buildExplicitRoute(route: RouterRouteConfig, index: number): CompiledRoute {
   const strategy = route.strategy ?? 'direct';
   const model = route.model ? stripProviderPrefix(route.model, route.provider) : undefined;
+  const implicitAliasesEnabled = route.implicitAliases !== false;
 
   if (strategy === 'round-robin' || strategy === 'sticky-failover') {
     return {
@@ -135,8 +136,7 @@ function buildExplicitRoute(route: RouterRouteConfig, index: number): CompiledRo
     providerId: route.provider,
     aliases: uniqueStrings([
       ...(route.aliases ?? []),
-      model,
-      model ? withProviderPrefix(route.provider, model) : undefined,
+      ...(implicitAliasesEnabled ? [model, model ? withProviderPrefix(route.provider, model) : undefined] : []),
     ]),
     fallbackAliases: uniqueStrings(route.fallbacks ?? []),
     strategy,

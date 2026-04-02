@@ -660,6 +660,118 @@ describe('provider-aware upstream routing', () => {
     await app.close();
   });
 
+  test('merges system messages into the first user message for providers configured with merge-to-first-user', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        custom: {
+          api: 'openai-responses',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://custom.example.test/v1',
+          systemMessageHandling: 'merge-to-first-user',
+          models: [
+            {
+              id: 'gpt-5.4',
+              name: 'Custom GPT-5.4',
+            },
+          ],
+        },
+      },
+      routes: [
+        {
+          id: 'custom-main',
+          provider: 'custom',
+          implicitAliases: false,
+          aliases: ['custom/gpt-5.4', 'LR/custom/gpt-5.4'],
+          model: 'gpt-5.4',
+        },
+      ],
+    });
+
+    chdir(dir);
+    process.env.Q_CUSTOM_API_KEY = 'custom-secret';
+
+    const fetchSpy = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      return new Response(
+        JSON.stringify({
+          id: 'resp-custom-system-merged',
+          output: [
+            {
+              type: 'message',
+              role: 'assistant',
+              content: [
+                {
+                  type: 'output_text',
+                  text: 'custom ok',
+                },
+              ],
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'custom/gpt-5.4',
+        messages: [
+          { role: 'system', content: 'You are concise.' },
+          { role: 'user', content: 'Say hello.' },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      id: 'resp-custom-system-merged',
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: 'custom ok',
+          },
+        },
+      ],
+    });
+
+    const [, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
+    const upstreamBody = JSON.parse(String(init.body)) as {
+      input: Array<{
+        type: string;
+        role: string;
+        content: Array<{ type: string; text: string }>;
+      }>;
+    };
+
+    expect(upstreamBody.input).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: 'You are concise.\n\nSay hello.',
+          },
+        ],
+      },
+    ]);
+
+    await app.close();
+  });
+
   test('encodes assistant history as output_text for codex responses input', async () => {
     const dir = writeRouterConfig({
       providers: {

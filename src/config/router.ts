@@ -28,6 +28,7 @@ export type RouterProviderConfig = {
   apiKeySource?: string;
   headers?: Record<string, string>;
   models?: RouterModelEntry[];
+  systemMessageHandling?: 'merge-to-first-user';
 };
 
 export type RouterRouteConfig = {
@@ -39,6 +40,7 @@ export type RouterRouteConfig = {
   strategy?: 'direct' | 'round-robin' | 'sticky-failover';
   members?: string[];
   failbackAfterMs?: number;
+  implicitAliases?: boolean;
 };
 
 export type ThinkingRewriteRule = {

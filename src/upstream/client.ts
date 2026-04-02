@@ -436,6 +436,107 @@ function normalizeResponsesTools(tools: unknown): unknown[] | undefined {
   });
 }
 
+function extractMessageTextForMerge(content: unknown): string {
+  if (typeof content === 'string') {
+    return content;
+  }
+
+  if (Array.isArray(content)) {
+    const textParts = content.flatMap((part) => {
+      if (typeof part === 'string') {
+        return [part];
+      }
+
+      if (
+        part
+        && typeof part === 'object'
+        && 'text' in part
+        && typeof (part as { text?: unknown }).text === 'string'
+      ) {
+        return [String((part as { text: string }).text)];
+      }
+
+      return [];
+    });
+
+    return textParts.join('\n');
+  }
+
+  if (
+    content
+    && typeof content === 'object'
+    && 'text' in content
+    && typeof (content as { text?: unknown }).text === 'string'
+  ) {
+    return String((content as { text: string }).text);
+  }
+
+  return String(content ?? '');
+}
+
+function applySystemMessageHandling(
+  messages: unknown,
+  provider: RouterProviderConfig,
+): unknown {
+  if (provider.systemMessageHandling !== 'merge-to-first-user' || !Array.isArray(messages)) {
+    return messages;
+  }
+
+  const systemMessages = messages.filter((message) =>
+    message
+    && typeof message === 'object'
+    && (message as Record<string, unknown>).role === 'system',
+  ) as Array<Record<string, unknown>>;
+
+  if (systemMessages.length === 0) {
+    return messages;
+  }
+
+  const mergedSystemText = systemMessages
+    .map((message) => extractMessageTextForMerge(message.content))
+    .filter((text) => text.trim().length > 0)
+    .join('\n\n');
+
+  const nonSystemMessages = messages.filter((message) =>
+    !message
+    || typeof message !== 'object'
+    || (message as Record<string, unknown>).role !== 'system',
+  ) as Array<Record<string, unknown>>;
+
+  if (mergedSystemText.length === 0) {
+    return nonSystemMessages;
+  }
+
+  const firstUserIndex = nonSystemMessages.findIndex((message) => message.role === 'user');
+  if (firstUserIndex === -1) {
+    return [
+      {
+        role: 'user',
+        content: mergedSystemText,
+      },
+      ...nonSystemMessages,
+    ];
+  }
+
+  const firstUserMessage = nonSystemMessages[firstUserIndex];
+  const firstUserContent = firstUserMessage.content;
+  const mergedUserContent =
+    typeof firstUserContent === 'string'
+      ? `${mergedSystemText}\n\n${firstUserContent}`
+      : Array.isArray(firstUserContent)
+        ? [{ type: 'text', text: mergedSystemText }, ...firstUserContent]
+        : mergedSystemText;
+
+  return nonSystemMessages.map((message, index) =>
+    index === firstUserIndex
+      ? {
+          ...message,
+          content: mergedUserContent,
+        }
+      : message,
+  );
+}
+
 type ResponsesMessageInputItem = {
   type: 'message';
   role: 'assistant' | 'system' | 'developer' | 'user';
@@ -1026,11 +1127,12 @@ function createOpenAIResponsesFetch(provider: RouterProviderConfig, timeoutMs: n
     const requestBody = body as Record<string, unknown>;
     const model = stripLrPrefix(requestBody.model) ?? '';
     const normalizedTools = normalizeResponsesTools(requestBody.tools);
+    const normalizedMessages = applySystemMessageHandling(requestBody.messages, provider);
     const upstreamUrl = `${baseUrl.replace(/\/$/, '')}/responses`;
     const streaming = streamRequested(requestBody);
     const upstreamBody = {
       model,
-      input: buildResponsesInput(requestBody.messages),
+      input: buildResponsesInput(normalizedMessages),
       stream: streaming,
       ...(normalizedTools ? { tools: normalizedTools } : {}),
       ...(requestBody.tool_choice !== undefined ? { tool_choice: requestBody.tool_choice } : {}),

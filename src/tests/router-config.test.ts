@@ -536,4 +536,68 @@ describe('router config file', () => {
 
     await app.close();
   });
+
+  test('does not auto-claim the bare model alias when a route disables implicitAliases', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        codex: {
+          api: 'openai-responses',
+          baseUrl: 'https://codex.example.test/v1',
+          models: [{ id: 'gpt-5.4', name: 'GPT-5.4' }],
+        },
+        custom: {
+          api: 'openai-responses',
+          baseUrl: 'https://custom.example.test/v1',
+          models: [{ id: 'gpt-5.4', name: 'Custom GPT-5.4' }],
+        },
+      },
+      routes: [
+        {
+          id: 'codex-main',
+          provider: 'codex',
+          aliases: ['LR/gpt-5.4', 'gpt-5.4'],
+          model: 'gpt-5.4',
+        },
+        {
+          id: 'custom-main',
+          provider: 'custom',
+          implicitAliases: false,
+          aliases: ['custom/gpt-5.4', 'LR/custom/gpt-5.4'],
+          model: 'gpt-5.4',
+        },
+      ],
+    });
+
+    chdir(dir);
+    const runtime = loadRouterRuntimeConfig();
+    const app = buildApp({
+      routerConfig: runtime,
+      fetchUpstream: async () => {
+        throw new Error('should not be called by /debug/routes');
+      },
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/debug/routes',
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      warnings: [],
+      routes: [
+        expect.objectContaining({
+          id: 'codex-main',
+          aliases: ['LR/gpt-5.4', 'gpt-5.4', 'codex/gpt-5.4'],
+        }),
+        expect.objectContaining({
+          id: 'custom-main',
+          aliases: ['custom/gpt-5.4', 'LR/custom/gpt-5.4'],
+          upstreamModel: 'gpt-5.4',
+        }),
+      ],
+    });
+
+    await app.close();
+  });
 });

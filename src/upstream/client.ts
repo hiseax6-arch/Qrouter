@@ -1,4 +1,5 @@
 import type { RouterProviderConfig, RouterThinkingConfig } from '../config/router.js';
+import { stripFailoverNoticesFromMessages } from '../ingress/failover-notice.js';
 import {
   extractTokenUsageFromPayload,
   toChatCompletionUsage,
@@ -1088,10 +1089,12 @@ function createOpenAICompletionsFetch(provider: RouterProviderConfig, timeoutMs:
 
   return async ({ body, requestId }) => {
     const requestBody = body as Record<string, unknown>;
+    const normalizedMessages = stripFailoverNoticesFromMessages(requestBody.messages);
     const upstreamUrl = `${baseUrl.replace(/\/$/, '')}/chat/completions`;
     const upstreamBody = {
       ...requestBody,
       model: stripLrPrefix(requestBody.model),
+      ...(normalizedMessages !== undefined ? { messages: normalizedMessages } : {}),
     };
 
     const response = await fetchJsonUpstream({
@@ -1127,7 +1130,10 @@ function createOpenAIResponsesFetch(provider: RouterProviderConfig, timeoutMs: n
     const requestBody = body as Record<string, unknown>;
     const model = stripLrPrefix(requestBody.model) ?? '';
     const normalizedTools = normalizeResponsesTools(requestBody.tools);
-    const normalizedMessages = applySystemMessageHandling(requestBody.messages, provider);
+    const normalizedMessages = applySystemMessageHandling(
+      stripFailoverNoticesFromMessages(requestBody.messages),
+      provider,
+    );
     const upstreamUrl = `${baseUrl.replace(/\/$/, '')}/responses`;
     const streaming = streamRequested(requestBody);
     const upstreamBody = {

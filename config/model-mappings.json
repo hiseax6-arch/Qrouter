@@ -4,11 +4,28 @@
       "id": "openrouter-stepfun",
       "provider": "openrouter",
       "aliases": [
+        "step",
+        "LR/step",
         "LR/stepfun/step-3.5-flash:free",
         "stepfun/step-3.5-flash:free",
         "openrouter/stepfun/step-3.5-flash:free"
       ],
       "model": "stepfun/step-3.5-flash:free"
+    },
+    {
+      "id": "openrouter-qwen36plus",
+      "provider": "openrouter",
+      "aliases": [
+        "qwen",
+        "qwen3.6",
+        "LR/qwen",
+        "LR/qwen3.6",
+        "openrouter/qwen3.6",
+        "LR/qwen/qwen3.6-plus:free",
+        "qwen/qwen3.6-plus:free",
+        "openrouter/qwen/qwen3.6-plus:free"
+      ],
+      "model": "qwen/qwen3.6-plus:free"
     },
     {
       "id": "openrouter-trinity-large",
@@ -28,7 +45,7 @@
         "codex/gpt-5.4"
       ],
       "fallbacks": [
-        "LR/stepfun/step-3.5-flash:free",
+        "LR/qwen/qwen3.6-plus:free",
         "LR/ms"
       ],
       "model": "gpt-5.4"
@@ -102,6 +119,19 @@
       "aliases": [
         "custom/gpt-5.4",
         "LR/custom/gpt-5.4"
+      ],
+      "model": "gpt-5.4"
+    },
+    {
+      "id": "custom2-main",
+      "provider": "custom2",
+      "implicitAliases": false,
+      "aliases": [
+        "g3",
+        "custom2/gpt-5.4",
+        "LR/custom2/gpt-5.4",
+        "custom2/gpt5.4",
+        "LR/custom2/gpt5.4"
       ],
       "model": "gpt-5.4"
     }

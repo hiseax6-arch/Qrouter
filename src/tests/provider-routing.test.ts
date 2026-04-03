@@ -3454,6 +3454,121 @@ describe('provider-aware upstream routing', () => {
     await app.close();
   });
 
+  test('strips prior q-router failover notices from assistant history and suppresses a new notice in follow-up requests', async () => {
+    const dir = writeRouterConfig({
+      providers: {
+        modelscope: {
+          api: 'openai-completions',
+          auth: 'api-key',
+          authHeader: true,
+          baseUrl: 'https://modelscope.example.test/v1',
+          models: modelScopePool.map((id) => ({
+            id,
+            name: id,
+          })),
+        },
+      },
+      models: {
+        allow: ['LR/ms'],
+      },
+    });
+
+    chdir(dir);
+    process.env.Q_MODELSCOPE_API_KEY = 'ms-secret';
+
+    let forcePrimary429 = true;
+    const observedBodies: Array<Record<string, unknown>> = [];
+    const fetchSpy = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      observedBodies.push(body);
+      if (body.model === modelScopePool[0] && forcePrimary429) {
+        return new Response(
+          JSON.stringify({
+            error: {
+              type: 'usage_limit_reached',
+              message: 'The usage limit has been reached',
+            },
+          }),
+          {
+            status: 403,
+            headers: {
+              'content-type': 'application/json',
+            },
+          },
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          id: `resp-${body.model}`,
+          choices: [
+            {
+              message: {
+                role: 'assistant',
+                content: `served by ${body.model}`,
+              },
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+          },
+        },
+      );
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const app = buildApp({
+      routerConfig: loadRouterRuntimeConfig(),
+      retryPolicy: {
+        maxAttempts: 4,
+        backoffMs: () => 0,
+      },
+    });
+
+    const firstResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'ms',
+        messages: [{ role: 'user', content: 'first' }],
+      },
+    });
+
+    expect(firstResponse.statusCode).toBe(200);
+    expect(firstResponse.body).toContain('[Q-router 提示]');
+    const priorAssistantContent = (firstResponse.json() as {
+      choices: Array<{ message: { content: string } }>;
+    }).choices[0].message.content;
+
+    forcePrimary429 = false;
+
+    const secondResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'ms',
+        messages: [
+          { role: 'user', content: 'first' },
+          { role: 'assistant', content: priorAssistantContent },
+          { role: 'user', content: 'continue' },
+        ],
+      },
+    });
+
+    expect(secondResponse.statusCode).toBe(200);
+    expect(secondResponse.body).toContain(`served by ${modelScopePool[1]}`);
+    expect(secondResponse.body).not.toContain('[Q-router 提示]');
+
+    const secondBody = observedBodies.at(-1) as { messages?: Array<{ role?: string; content?: unknown }> };
+    const assistantHistory = secondBody.messages?.find((message) => message.role === 'assistant');
+    expect(JSON.stringify(assistantHistory ?? {})).not.toContain('[Q-router 提示]');
+
+    await app.close();
+  });
+
   test('automatically includes newly added routes in the default fallback chain', async () => {
     const dir = writeRouterConfig({
       providers: {
@@ -3854,6 +3969,7 @@ describe('provider-aware upstream routing', () => {
           auth: 'api-key',
           authHeader: false,
           baseUrl: 'https://api.xiaomimimo.com/v1',
+          ttsMessageHandling: 'user-to-assistant',
           models: [
             {
               id: mimoTtsModel,
@@ -3915,7 +4031,7 @@ describe('provider-aware upstream routing', () => {
       payload: {
         model: 'tts',
         messages: [
-          { role: 'assistant', content: 'Hello from MiMo TTS.' },
+          { role: 'user', content: 'Hello from MiMo TTS.' },
         ],
         audio: {
           format: 'wav',
@@ -3953,6 +4069,12 @@ describe('provider-aware upstream routing', () => {
         format: 'wav',
         voice: 'mimo_default',
       },
+      messages: [
+        {
+          role: 'assistant',
+          content: 'Hello from MiMo TTS.',
+        },
+      ],
     });
 
     await app.close();
@@ -3966,6 +4088,7 @@ describe('provider-aware upstream routing', () => {
           auth: 'api-key',
           authHeader: false,
           baseUrl: 'https://api.xiaomimimo.com/v1',
+          ttsMessageHandling: 'user-to-assistant',
           models: [
             {
               id: mimoTtsModel,
@@ -4029,7 +4152,7 @@ describe('provider-aware upstream routing', () => {
         model: 'tts',
         stream: true,
         messages: [
-          { role: 'assistant', content: '<style>Happy</style>Hello streaming TTS.' },
+          { role: 'user', content: '<style>Happy</style>Hello streaming TTS.' },
         ],
         audio: {
           format: 'pcm16',
@@ -4042,6 +4165,12 @@ describe('provider-aware upstream routing', () => {
     expect(response.body).toContain('YXVkaW8tY2h1bmstMQ==');
     expect(response.body).toContain('data: [DONE]');
     expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    const [url, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('https://api.xiaomimimo.com/v1/chat/completions');
+    expect(JSON.parse(String(init.body)).messages).toEqual([
+      { role: 'assistant', content: '<style>Happy</style>Hello streaming TTS.' },
+    ]);
 
     await app.close();
   });

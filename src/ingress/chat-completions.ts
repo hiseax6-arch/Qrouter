@@ -30,6 +30,7 @@ import {
   appendFailoverNoticeToChatPayload,
   buildFailoverNotice,
   buildFailoverNoticeChatStreamChunk,
+  messagesContainFailoverNotice,
 } from './failover-notice.js';
 import {
   buildAllowedModelCandidates,
@@ -467,6 +468,7 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
     const requestId = randomUUID();
     const body = (request.body ?? {}) as ChatCompletionsRequestBody;
     const requestRoutingControls = extractRequestRoutingControls(request, body as Record<string, unknown>);
+    const historyAlreadyContainsFailoverNotice = messagesContainFailoverNotice(body.messages);
     const rawRequestedModel = body.model ?? null;
     const requestedModel = resolveRequestedModelAlias(rawRequestedModel, deps.allowedModels);
     if (requestedModel && requestedModel !== rawRequestedModel) {
@@ -806,7 +808,7 @@ export function createChatCompletionsHandler(deps: ChatCompletionsDeps) {
         return null;
       }
 
-      if (!failoverNoticeActivated) {
+      if (!failoverNoticeActivated || historyAlreadyContainsFailoverNotice) {
         return null;
       }
 

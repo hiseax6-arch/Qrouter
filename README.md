@@ -12,6 +12,7 @@ Q-router is a local OpenAI-compatible gateway for OpenClaw. OpenClaw already has
 - Rejects empty-success or malformed upstream responses to prevent blank assistant outputs
 - Keeps routing explicit across multiple upstream model providers instead of relying on opaque provider-side switching
 - Stores local request traces in JSONL and SQLite for debugging unstable outputs and incident review
+- Preserves larger upstream error body snippets in terminal payloads and ingress traces, making non-JSON and partially structured upstream failures easier to diagnose
 
 ## Who It Is For
 Q-router is a good fit if you:
@@ -102,7 +103,7 @@ In practice:
   - `openai-responses` -> `<baseUrl>/responses`
 - `baseUrl` is the upstream root URL
 - `apiKeyEnv` is the preferred way to bind secrets
-- `routes[*].aliases` are caller-facing model names
+- `routes[*].aliases` are caller-facing model names (for example `custom/gpt-5.4`, `LR/custom/gpt-5.4`, `g1`, and `LR/g1` can all point at the same upstream route)
 - `routes[*].provider` + `routes[*].model` decide actual upstream target
 - `routes[*].fallbacks` define candidate order after primary retry budget is exhausted
 - `routes[*].failbackAfterMs` lets a `sticky-failover` route return to its primary member after cooldown

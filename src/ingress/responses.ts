@@ -963,7 +963,7 @@ export function createResponsesHandler(deps: ResponsesDeps) {
           lastUpstreamError = {
             type: 'upstream_non_json',
             message: `Upstream returned non-JSON response (status ${upstream.status})`,
-            bodySnippet: upstreamText.slice(0, 200),
+            bodySnippet: upstreamText.slice(0, 400),
           };
           finalClassification = 'upstream_non_json';
           errorClass = 'upstream_non_json';

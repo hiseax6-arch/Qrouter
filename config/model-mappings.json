@@ -118,7 +118,9 @@
       "implicitAliases": false,
       "aliases": [
         "custom/gpt-5.4",
-        "LR/custom/gpt-5.4"
+        "LR/custom/gpt-5.4",
+        "g1",
+        "LR/g1"
       ],
       "model": "gpt-5.4"
     },

@@ -5,7 +5,7 @@ export type UpstreamFailureDetails = {
   bodySnippet?: string;
 };
 
-function truncateForTrace(value: string, maxLength = 240): string {
+function truncateForTrace(value: string, maxLength = 600): string {
   if (value.length <= maxLength) {
     return value;
   }
@@ -41,7 +41,7 @@ export function parseUpstreamErrorDetails(bodyText: string): UpstreamFailureDeta
     // Keep a text snippet for non-JSON upstream failures.
   }
 
-  const bodySnippet = truncateForTrace(trimmed, 400);
+  const bodySnippet = truncateForTrace(trimmed, 600);
   if (!type && !code && !message && !bodySnippet) {
     return null;
   }

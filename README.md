@@ -103,7 +103,7 @@ In practice:
   - `openai-responses` -> `<baseUrl>/responses`
 - `baseUrl` is the upstream root URL
 - `apiKeyEnv` is the preferred way to bind secrets
-- `routes[*].aliases` are caller-facing model names (for example `custom/gpt-5.4`, `LR/custom/gpt-5.4`, `g1`, and `LR/g1` can all point at the same upstream route)
+- `routes[*].aliases` are caller-facing model names
 - `routes[*].provider` + `routes[*].model` decide actual upstream target
 - `routes[*].fallbacks` define candidate order after primary retry budget is exhausted
 - `routes[*].failbackAfterMs` lets a `sticky-failover` route return to its primary member after cooldown
